@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 display = ["rich>=13"]
+tui = ["textual>=8"]
 dev = ["pytest", "hypothesis"]
 
 [build-system]

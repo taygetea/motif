@@ -222,6 +222,52 @@ async def complete(
     return result
 
 
+async def stream(
+    msg: Msg,
+    *,
+    model: str = _UNSET,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float | None = None,
+    backend: str = "anthropic",
+    meta: dict | None = None,
+):
+    """Msg in, async iterator of text chunks out.
+
+    Same as complete() but yields tokens as they arrive.
+    The full text is also notified to observers after the stream ends.
+
+        async for chunk in llm.stream(prompt):
+            print(chunk, end="", flush=True)
+    """
+    if model is _UNSET:
+        model = DEFAULT_MODEL
+    client = _get_client()
+    payload = render(msg, backend=backend)
+
+    kwargs = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": payload["messages"],
+    }
+    if "system" in payload:
+        kwargs["system"] = payload["system"]
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    full_text = []
+    async with client.messages.stream(**kwargs) as s:
+        async for text in s.text_stream:
+            full_text.append(text)
+            yield text
+        response = await s.get_final_message()
+
+    result = "".join(full_text)
+    _notify("stream", msg, result, model, {
+        **(meta or {}),
+        **_usage(response),
+    })
+
+
 async def extract(
     msg: Msg,
     schema: dict,

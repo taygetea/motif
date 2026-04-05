@@ -63,10 +63,6 @@ class Trace:
             result.append(d)
         return result
 
-    def save(self, path: str):
-        """Save the trace to JSON."""
-        Path(path).write_text(json.dumps(self.to_json(), indent=2, ensure_ascii=False))
-
     @classmethod
     def load(cls, path: str) -> Trace:
         """Load a trace from JSON. Events have relative timestamps (seconds
@@ -115,6 +111,68 @@ class Trace:
         if not self.events:
             return 0
         return self.events[-1].timestamp - self.events[0].timestamp
+
+    def to_markdown(self) -> str:
+        """Render the trace as readable markdown.
+
+        Complete results are shown in full (not truncated like summary()).
+        The tree structure is preserved with headings and indentation.
+        """
+        lines = []
+        for e in self.events:
+            depth = e.depth
+            elapsed = f" ({e.elapsed:.1f}s)" if e.elapsed else ""
+
+            match e.kind:
+                case "start":
+                    pass  # starts are implicit in the structure
+                case "split":
+                    children = ", ".join(e.children or [])
+                    heading = "#" * min(depth + 2, 6)
+                    lines.append(f"\n{heading} {e.label} → {children}{elapsed}\n")
+                case "complete":
+                    heading = "#" * min(depth + 2, 6)
+                    lines.append(f"\n{heading} {e.label}{elapsed}\n")
+                    if e.result:
+                        lines.append(e.result)
+                        lines.append("")
+                case "merge":
+                    heading = "#" * min(depth + 2, 6)
+                    lines.append(f"\n{heading} {e.label} (synthesis){elapsed}\n")
+                    if e.result:
+                        lines.append(e.result)
+                        lines.append("")
+                case "error":
+                    lines.append(f"\n**ERROR: {e.label}**: {e.result or 'unknown'}\n")
+
+        return "\n".join(lines)
+
+    def save(self, path: str, *, format: str = "auto"):
+        """Save the trace. Format is inferred from extension or specified.
+
+            trace.save("run.json")       # JSON (machine-readable)
+            trace.save("run.md")         # Markdown (human-readable)
+            trace.save("run.txt")        # Text summary
+            trace.save("run", format="json")  # explicit format
+        """
+        if format == "auto":
+            if path.endswith(".md"):
+                format = "markdown"
+            elif path.endswith(".txt"):
+                format = "text"
+            else:
+                format = "json"
+
+        match format:
+            case "json":
+                Path(path).write_text(
+                    json.dumps(self.to_json(), indent=2, ensure_ascii=False))
+            case "markdown":
+                Path(path).write_text(self.to_markdown())
+            case "text":
+                Path(path).write_text(self.summary())
+            case _:
+                raise ValueError(f"Unknown format: {format!r}")
 
     def __len__(self):
         return len(self.events)
