@@ -45,6 +45,88 @@ def clear_observers():
     _observers.clear()
 
 
+# Pricing per million tokens (input, output, cache_read, cache_write).
+# Cache reads are cheaper; cache writes cost extra on top of input.
+# Updated for current Anthropic pricing as of early 2026.
+_PRICING: dict[str, tuple[float, float, float, float]] = {
+    "claude-opus-4-6":      (15.00, 75.00, 1.50, 18.75),
+    "claude-opus-4-5":      (15.00, 75.00, 1.50, 18.75),
+    "claude-sonnet-4-6":    (3.00,  15.00, 0.30, 3.75),
+    "claude-sonnet-4-5":    (3.00,  15.00, 0.30, 3.75),
+    "claude-haiku-4-5":     (0.80,  4.00,  0.08, 1.00),
+}
+
+
+class CostTracker:
+    """LLM observer that tracks token usage and cost.
+
+        tracker = CostTracker()
+        llm.observe(tracker)
+        # ... run pipeline ...
+        print(tracker)   # Cost: $0.42 (12,340 in / 3,210 out)
+        tracker.cost     # 0.42
+        tracker.reset()
+
+    Attaches to llm.observe(), not flow.observe(). Pricing is
+    looked up by model name; unknown models track tokens but not cost.
+    """
+
+    def __init__(self):
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.cache_read_tokens: int = 0
+        self.cache_creation_tokens: int = 0
+        self.calls: int = 0
+        self._cost: float = 0.0
+
+    def __call__(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
+        inp = meta.get("input_tokens", 0)
+        out = meta.get("output_tokens", 0)
+        cache_read = meta.get("cache_read_tokens", 0)
+        cache_create = meta.get("cache_creation_tokens", 0)
+
+        self.input_tokens += inp
+        self.output_tokens += out
+        self.cache_read_tokens += cache_read
+        self.cache_creation_tokens += cache_create
+        self.calls += 1
+
+        # Look up pricing — strip date suffixes for matching
+        base_model = model
+        for name, prices in _PRICING.items():
+            if model.startswith(name) or name.startswith(model):
+                base_model = name
+                break
+
+        if base_model in _PRICING:
+            p_in, p_out, p_cache_read, p_cache_write = _PRICING[base_model]
+            # Cache reads replace regular input tokens in billing
+            regular_input = inp - cache_read - cache_create
+            self._cost += (
+                regular_input * p_in / 1_000_000
+                + out * p_out / 1_000_000
+                + cache_read * p_cache_read / 1_000_000
+                + cache_create * p_cache_write / 1_000_000
+            )
+
+    @property
+    def cost(self) -> float:
+        return round(self._cost, 4)
+
+    def reset(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_creation_tokens = 0
+        self.calls = 0
+        self._cost = 0.0
+
+    def __repr__(self):
+        return (f"Cost: ${self.cost:.4f} "
+                f"({self.input_tokens:,} in / {self.output_tokens:,} out / "
+                f"{self.calls} calls)")
+
+
 def _notify(verb: str, msg: Msg, result: Any, model: str, meta: dict):
     for obs in _observers:
         try:
