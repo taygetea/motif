@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Any
 
@@ -825,7 +826,6 @@ async def agent(
 
         if result.stop_reason == "max_tokens":
             # Truncated — warn and continue so the model can finish
-            import warnings
             warnings.warn(f"agent step {step + 1}: response truncated (max_tokens)")
             _emit(FlowEvent("error", step_label, 1, result="truncated (max_tokens)"))
             # Append what we got so the model can continue from it
