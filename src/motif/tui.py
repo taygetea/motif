@@ -228,24 +228,43 @@ class FlowApp(App):
         self._main = self.query_one("#main", VerticalScroll)
         self._status = self.query_one("#status", StatusBar)
         if self._pipeline_fn:
-            self._run_pipeline()
+            self.run_worker(self._run_pipeline())
 
     def run_pipeline(self, fn):
         """Set the pipeline to run on mount. fn is an async callable."""
         self._pipeline_fn = fn
 
-    @work
     async def _run_pipeline(self):
         try:
+            if self._status:
+                self._status.update("running...")
             self._pipeline_result = await self._pipeline_fn()
+            if self._status:
+                self._status.update("done")
         except Exception as e:
-            self._status.update(f"error: {e}")
+            if self._status:
+                self._status.update(f"error: {e}")
+            raise
 
     def flow_observer(self, event: FlowEvent):
         """Attach to flow.observe(). Builds layout from topology."""
-        self.call_from_thread(self._handle_flow_event, event)
+        # We're called from within the async loop (same thread as Textual),
+        # so we can post messages directly.
+        self.post_message(self._FlowEventMsg(event))
 
-    def _handle_flow_event(self, event: FlowEvent):
+    class _FlowEventMsg(App.Message):
+        def __init__(self, event: FlowEvent):
+            super().__init__()
+            self.event = event
+
+    class _ChunkMsg(App.Message):
+        def __init__(self, node: str, text: str):
+            super().__init__()
+            self.node = node
+            self.text = text
+
+    def on__flow_event_msg(self, message: _FlowEventMsg):
+        event = message.event
         match event.kind:
             case "split":
                 children = event.children or []
@@ -261,7 +280,6 @@ class FlowApp(App):
 
             case "start":
                 if event.label not in self._panels and self._main:
-                    # Single node, not part of a split — full width
                     single = SinglePanel(
                         event.label,
                         id=f"single-{_safe_id(event.label)}")
@@ -279,13 +297,11 @@ class FlowApp(App):
             case "complete":
                 panel = self._panels.get(event.label)
                 if panel:
-                    asyncio.ensure_future(
-                        panel.mark_complete(event.elapsed))
+                    panel.set_status(f"done ({event.elapsed:.1f}s)")
 
             case "merge":
                 if self._status:
                     self._status.update(f"⇐ {event.label} ({event.elapsed:.1f}s)")
-                # Create a panel for the merge result if there's content
                 if event.result and self._main:
                     single = SinglePanel(
                         f"⇐ {event.label}",
@@ -293,19 +309,16 @@ class FlowApp(App):
                     self._main.mount(single)
                     if single.panel:
                         self._panels[f"⇐ {event.label}"] = single.panel
-                        asyncio.ensure_future(
-                            single.panel.write_chunk(event.result))
-                        asyncio.ensure_future(
-                            single.panel.mark_complete(event.elapsed))
+                        single.panel.set_status(f"done ({event.elapsed:.1f}s)")
 
     def llm_observer(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
         """Attach to llm.observe(). Routes chunks to panels."""
         if verb == "chunk":
             node = meta.get("node")
             if node:
-                self.call_from_thread(self._handle_chunk, node, result)
+                self.post_message(self._ChunkMsg(node, result))
 
-    def _handle_chunk(self, node: str, text: str):
-        panel = self._panels.get(node)
-        if panel:
-            asyncio.ensure_future(panel.write_chunk(text))
+    def on__chunk_msg(self, message: _ChunkMsg):
+        panel = self._panels.get(message.node)
+        if panel and panel._stream:
+            panel._stream.write(message.text)
