@@ -65,6 +65,29 @@ def observe(*observers: Callable[[FlowEvent], None]):
     _observers.extend(observers)
 
 
+class observing:
+    """Context manager that attaches observers and removes them on exit.
+
+        async with flow.observing(trace, display):
+            result = await flow.fan(items, fn)
+        # observers automatically removed — no manual clear_observers()
+    """
+
+    def __init__(self, *observers: Callable[[FlowEvent], None]):
+        self._observers = list(observers)
+
+    async def __aenter__(self):
+        _observers.extend(self._observers)
+        return self
+
+    async def __aexit__(self, *args):
+        for obs in self._observers:
+            try:
+                _observers.remove(obs)
+            except ValueError:
+                pass
+
+
 def clear_observers():
     """Remove all flow observers."""
     _observers.clear()
@@ -140,6 +163,15 @@ async def compact(
     Preserves system segments (persona, instructions) and the most
     recent turns. Summarizes everything in between into a single
     user segment. Returns the original Msg unchanged if under threshold.
+
+    Referential integrity: tool_use/tool_result pairs are never split.
+    The boundary walks backward to keep all pairs intact.
+
+    Semantic limitation: if tool call B depends on the result of tool
+    call A, and A is compacted while B is kept, the dependency is
+    captured only through the summarizer's description — not through
+    the original segments. The summary should preserve the chain,
+    but this is LLM-quality-dependent.
 
     Called automatically by agent() — users don't need to call this directly.
     """
@@ -470,6 +502,7 @@ async def tree(
     leaf_fn: Callable[[str], Msg],
     merge_fn: Callable[[list[str], list[str]], Msg],
     *,
+    paragraph_fn: Callable[[str], list[str]] | None = None,
     max_depth: int = 3,
     model_split: str = _CHEAP,
     model_leaf: str = llm.DEFAULT_MODEL,
@@ -481,7 +514,11 @@ async def tree(
 
     The splitter returns paragraph ranges, not reproduced text. The
     original text is sliced by the framework — no JSON reproduction of
-    large documents. Paragraphs are \\n\\n-separated chunks of the input.
+    large documents.
+
+    paragraph_fn splits text into indexable chunks. Defaults to
+    \\n\\n splitting. Override for texts where \\n\\n doesn't align
+    with logical boundaries (e.g., code blocks, quoted passages).
 
     split_fn(task) → Msg asking the model to split or analyze as-is.
     split_schema must have:
@@ -531,7 +568,8 @@ async def tree(
         return result
 
     # Slice the original text by paragraph ranges — no text in JSON
-    paragraphs = task.split("\n\n")
+    _split = paragraph_fn or (lambda t: t.split("\n\n"))
+    paragraphs = _split(task)
     child_labels = []
     child_texts = []
 
@@ -561,9 +599,9 @@ async def tree(
     child_results = await asyncio.gather(*[
         tree(
             text, split_fn, split_schema, leaf_fn, merge_fn,
-            max_depth=max_depth, model_split=model_split,
-            model_leaf=model_leaf, model_merge=model_merge,
-            label=clabel, _depth=_depth + 1,
+            paragraph_fn=paragraph_fn, max_depth=max_depth,
+            model_split=model_split, model_leaf=model_leaf,
+            model_merge=model_merge, label=clabel, _depth=_depth + 1,
         )
         for clabel, text in zip(child_labels, child_texts)
     ])
@@ -799,6 +837,7 @@ async def agent(
     signal_tools = signal_tools or {}
     _emit(FlowEvent("start", label, 0, meta={"model": model, "max_steps": max_steps}))
     t_total = time.monotonic()
+    last_text = ""  # tracks the most recent output for timeout/max_steps
 
     for step in range(max_steps):
         # Wall-clock timeout
@@ -808,7 +847,7 @@ async def agent(
                              result=f"timeout ({timeout}s)",
                              meta={"steps": step, "signal": "timeout"}))
             return AgentResult(
-                output=result.text if step > 0 and result else "",
+                output=last_text,
                 signal="timeout",
                 msg=msg,
                 steps=step,
@@ -823,6 +862,8 @@ async def agent(
         t0 = time.monotonic()
 
         result = await llm.act(msg, tool_schemas, model=model)
+        if result.text:
+            last_text = result.text
 
         if result.stop_reason == "max_tokens":
             # Truncated — warn and continue so the model can finish
@@ -857,7 +898,7 @@ async def agent(
 
         # Process tool calls
         for call in result.tool_calls:
-            call_label = f"{call.name}"
+            call_label = f"{call.name} ({call.id[:8]})"
             _emit(FlowEvent("start", call_label, 2, meta={"tool_id": call.id}))
             tc0 = time.monotonic()
 
@@ -930,7 +971,7 @@ async def agent(
                      result=f"max steps ({max_steps})",
                      meta={"steps": max_steps, "signal": "max_steps"}))
     return AgentResult(
-        output=result.text or "",
+        output=last_text,
         signal="max_steps",
         msg=msg,
         steps=max_steps,

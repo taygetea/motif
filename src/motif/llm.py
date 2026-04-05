@@ -79,21 +79,39 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return _client
 
 
+def _usage(response) -> dict:
+    """Extract token usage from an API response for observer meta."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return {}
+    return {
+        "input_tokens": getattr(usage, "input_tokens", 0),
+        "output_tokens": getattr(usage, "output_tokens", 0),
+        "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0),
+        "cache_creation_tokens": getattr(usage, "cache_creation_input_tokens", 0),
+    }
+
+
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CHEAP_MODEL = "claude-haiku-4-5"  # used by flow.py for structural decisions
 DEFAULT_MAX_TOKENS = 16000
+
+# Sentinel for "use whatever DEFAULT_MODEL is at call time"
+_UNSET = object()
 
 
 async def complete(
     msg: Msg,
     *,
-    model: str = DEFAULT_MODEL,
+    model: str = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
     backend: str = "anthropic",
     meta: dict | None = None,
 ) -> str:
     """Msg in, text out."""
+    if model is _UNSET:
+        model = DEFAULT_MODEL
     client = _get_client()
     payload = render(msg, backend=backend)
 
@@ -115,7 +133,10 @@ async def complete(
             text_parts.append(block.text)
     result = "\n".join(text_parts)
 
-    _notify("complete", msg, result, model, meta or {})
+    _notify("complete", msg, result, model, {
+        **(meta or {}),
+        **_usage(response),
+    })
     return result
 
 
@@ -123,7 +144,7 @@ async def extract(
     msg: Msg,
     schema: dict,
     *,
-    model: str = DEFAULT_MODEL,
+    model: str = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
     backend: str = "anthropic",
@@ -134,6 +155,8 @@ async def extract(
     Uses output_config with json_schema for structured output.
     Falls back to forced tool use on older SDK versions.
     """
+    if model is _UNSET:
+        model = DEFAULT_MODEL
     client = _get_client()
     payload = render(msg, backend=backend)
 
@@ -158,7 +181,7 @@ async def extract(
         for block in response.content:
             if block.type == "text":
                 result = json.loads(block.text)
-                _notify("extract", msg, result, model, meta or {})
+                _notify("extract", msg, result, model, {**(meta or {}), **_usage(response)})
                 return result
         raise ValueError("No text block in structured response")
 
@@ -176,7 +199,7 @@ async def extract(
         for block in response.content:
             if block.type == "tool_use" and block.name == tool_name:
                 result = block.input
-                _notify("extract", msg, result, model, meta or {})
+                _notify("extract", msg, result, model, {**(meta or {}), **_usage(response)})
                 return result
         raise ValueError("No tool_use block in structured response")
 
@@ -212,7 +235,7 @@ async def act(
     msg: Msg,
     tools: list[dict],
     *,
-    model: str = DEFAULT_MODEL,
+    model: str = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
     backend: str = "anthropic",
@@ -237,6 +260,8 @@ async def act(
                 prompt = prompt | tool_use(call.id, call.name, call.input) \\
                                 | tool_result(call.id, output)
     """
+    if model is _UNSET:
+        model = DEFAULT_MODEL
     client = _get_client()
     payload = render(msg, backend=backend)
 
@@ -274,5 +299,5 @@ async def act(
         stop_reason=getattr(response, "stop_reason", None),
     )
 
-    _notify("act", msg, result, model, meta or {})
+    _notify("act", msg, result, model, {**(meta or {}), **_usage(response)})
     return result

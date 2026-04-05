@@ -105,9 +105,10 @@ class TestOpenAIEdges:
         assert "part 2" in p["messages"][0]["content"]
 
     def test_text_then_tool_use(self):
-        """Assistant text followed by tool_use — OpenAI puts tool_calls on a separate message."""
+        """Assistant text + tool_use merge into one message (OpenAI requires this)."""
         msg = assistant("thinking...") | tool_use("c1", "fn", {})
         p = render(msg, backend="openai")
-        # First message is text, second is tool_calls
+        # One message with both content and tool_calls
+        assert len(p["messages"]) == 1
         assert p["messages"][0]["content"] == "thinking..."
-        assert "tool_calls" in p["messages"][1]
+        assert p["messages"][0]["tool_calls"][0]["function"]["name"] == "fn"

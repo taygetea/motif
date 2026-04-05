@@ -299,8 +299,10 @@ def _render_openai(msg: Msg) -> dict:
                     "id": id, "type": "function",
                     "function": {"name": name, "arguments": json.dumps(input)},
                 }
-                if messages and messages[-1]["role"] == "assistant" and "tool_calls" in messages[-1]:
-                    messages[-1]["tool_calls"].append(tool_call)
+                if messages and messages[-1]["role"] == "assistant":
+                    # Merge into existing assistant message — OpenAI requires
+                    # content + tool_calls in one message, not two.
+                    messages[-1].setdefault("tool_calls", []).append(tool_call)
                 else:
                     messages.append({
                         "role": "assistant", "content": None,
