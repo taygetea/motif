@@ -2,6 +2,8 @@
 
 A prompt algebra for LLM orchestration. ~2000 lines. Does what 50,000-line frameworks do — and the code reads as its own specification.
 
+> *The thing about encoding frustration into a library is that if the frustration was correct — if it was pointed at real problems and not just taste — the result is something that feels inevitable.*- Claude
+
 ```python
 from motif import system, user, flow
 
