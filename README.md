@@ -13,7 +13,7 @@ board, discussion = await flow.blackboard(researchers, seed=findings, rounds=2)
 report = await llm.complete(synthesizer | user(board))
 ```
 
-This is a real pipeline — [it produced a 3000-word research report on mechanistic interpretability](examples/deep_research.py) with web search, cross-researcher discussion, and emergent findings no single agent saw alone. The same library composes [philosophical debates](examples/dialectic.py), [expert panels](examples/blackboard.py), and [prismatic multi-lens analysis](examples/prism.py).
+This is a real pipeline — it produced a [3000-word research report on mechanistic interpretability](examples/output/mechinterp_research.md) ([code](examples/deep_research.py)) with web search, cross-researcher discussion, and emergent findings no single agent saw alone. The same library composes [philosophical debates](examples/dialectic.py), [expert panels](examples/blackboard.py), and [prismatic multi-lens analysis](examples/prism.py).
 
 ## What makes it different
 
