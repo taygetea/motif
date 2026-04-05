@@ -121,7 +121,7 @@ class PanelRow(Widget):
     DEFAULT_CSS = """
     PanelRow {
         height: 1fr;
-        min-height: 15;
+        min-height: 20;
     }
     PanelRow HorizontalScroll {
         height: 1fr;
@@ -132,21 +132,28 @@ class PanelRow(Widget):
         color: $text-muted;
         padding: 0 1;
     }
+    PanelRow StreamPanel {
+        width: 50;
+        min-width: 40;
+        height: 100%;
+    }
     """
 
     def __init__(self, label: str, panel_names: list[str], **kwargs):
         super().__init__(**kwargs)
         self._label = label
         self._panel_names = panel_names
-        self.panels: dict[str, StreamPanel] = {}
+        # Create panels NOW so they can buffer chunks before mount
+        self.panels: dict[str, StreamPanel] = {
+            name: StreamPanel(name, id=f"panel-{_safe_id(name)}")
+            for name in panel_names
+        }
 
     def compose(self) -> ComposeResult:
         yield Static(f"◆ {self._label}", classes="row-label")
         with HorizontalScroll():
             for name in self._panel_names:
-                panel = StreamPanel(name, id=f"panel-{_safe_id(name)}")
-                self.panels[name] = panel
-                yield panel
+                yield self.panels[name]
 
 
 class SinglePanel(Widget):
@@ -163,10 +170,9 @@ class SinglePanel(Widget):
     def __init__(self, label: str, **kwargs):
         super().__init__(**kwargs)
         self._label = label
-        self.panel: StreamPanel | None = None
+        self.panel = StreamPanel(self._label, id=f"panel-{_safe_id(self._label)}")
 
     def compose(self) -> ComposeResult:
-        self.panel = StreamPanel(self._label, id=f"panel-{_safe_id(self._label)}")
         yield self.panel
 
 
