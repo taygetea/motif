@@ -176,7 +176,7 @@ def _usage(response) -> dict:
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CHEAP_MODEL = "claude-haiku-4-5"  # used by flow.py for structural decisions
-DEFAULT_MAX_TOKENS = 16000
+DEFAULT_MAX_TOKENS = 32000
 
 # Sentinel for "use whatever DEFAULT_MODEL is at call time"
 _UNSET = object()
@@ -188,12 +188,27 @@ async def complete(
     model: str = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
+    streaming: bool = False,
     backend: str = "anthropic",
     meta: dict | None = None,
 ) -> str:
-    """Msg in, text out."""
+    """Msg in, text out.
+
+    streaming=True emits per-chunk notifications to observers (for live display)
+    while still returning the complete text. Same result, richer observation.
+    """
     if model is _UNSET:
         model = DEFAULT_MODEL
+
+    if streaming:
+        # Use stream() internally, collect the result
+        chunks = []
+        async for chunk in stream(msg, model=model, max_tokens=max_tokens,
+                                   temperature=temperature, backend=backend,
+                                   meta=meta):
+            chunks.append(chunk)
+        return "".join(chunks)
+
     client = _get_client()
     payload = render(msg, backend=backend)
 
@@ -254,18 +269,17 @@ async def stream(
     if temperature is not None:
         kwargs["temperature"] = temperature
 
+    _meta = meta or {}
     full_text = []
     async with client.messages.stream(**kwargs) as s:
         async for text in s.text_stream:
             full_text.append(text)
+            _notify("chunk", msg, text, model, _meta)
             yield text
         response = await s.get_final_message()
 
     result = "".join(full_text)
-    _notify("stream", msg, result, model, {
-        **(meta or {}),
-        **_usage(response),
-    })
+    _notify("stream", msg, result, model, {**_meta, **_usage(response)})
 
 
 async def extract(

@@ -309,18 +309,21 @@ async def fan(
     *,
     model: str = llm.DEFAULT_MODEL,
     max_concurrency: int | None = None,
+    streaming: bool = False,
     label: str = "fan",
     depth: int = 0,
     **kw,
 ) -> list[str]:
     """Parallel complete() over items. fn maps each item to a Msg.
 
-    max_concurrency limits how many calls run simultaneously (for rate limits).
+    max_concurrency limits how many calls run simultaneously.
+    streaming=True emits per-chunk notifications for live display.
 
         analyses = await fan(
             methods,
             lambda m: analyst | user(f"Use {m['name']}:\\n{doc}"),
             max_concurrency=5,
+            streaming=True,
         )
     """
     _emit(FlowEvent("start", label, depth, meta={"count": len(items), "model": model}))
@@ -334,7 +337,9 @@ async def fan(
             name = _item_label(item, idx)
             _emit(FlowEvent("start", name, depth + 1, meta={"model": model}))
             t1 = time.monotonic()
-            result = await llm.complete(fn(item), model=model, **kw)
+            result = await llm.complete(
+                fn(item), model=model, streaming=streaming,
+                meta={"node": name}, **kw)
             elapsed = time.monotonic() - t1
             _emit(FlowEvent("complete", name, depth + 1,
                              result=_truncate(result), elapsed=elapsed))
