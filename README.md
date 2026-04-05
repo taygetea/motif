@@ -1,6 +1,6 @@
 # motif
 
-A prompt algebra for LLM orchestration. Under 2000 lines. Does what 50,000-line frameworks do — and the code reads as its own specification.
+A prompt algebra for LLM orchestration. ~2000 lines. Does what 50,000-line frameworks do — and the code reads as its own specification.
 
 ```python
 from motif import system, user, flow
@@ -13,7 +13,7 @@ board, discussion = await flow.blackboard(researchers, seed=findings, rounds=2)
 report = await llm.complete(synthesizer | user(board))
 ```
 
-This is a real pipeline — it produced a [3000-word research report on mechanistic interpretability](examples/output/mechinterp_research.md) ([code](examples/deep_research.py)) with web search, cross-researcher discussion, and emergent findings no single agent saw alone. The same library composes [philosophical debates](examples/dialectic.py), [expert panels](examples/blackboard.py), and [prismatic multi-lens analysis](examples/prism.py).
+This is a real pipeline — it produced a [research report on mechanistic interpretability](examples/output/mechinterp_research.md) ([code](examples/deep_research.py)) with web search, cross-researcher discussion, and emergent findings no single agent saw alone. The same library composes [philosophical debates](examples/dialectic.py), [expert panels](examples/blackboard.py), and [prismatic multi-lens analysis](examples/prism.py).
 
 ## What makes it different
 
@@ -202,10 +202,10 @@ python examples/deep_research.py "your topic"   # Deep research with web search 
 
 ```
 src/motif/
-    prompt.py    ~360 lines   Msg, Block, segments, render — zero dependencies
-    llm.py       ~270 lines   complete, extract, act — anthropic SDK
-    flow.py      ~840 lines   9 flow patterns + compaction + events
+    prompt.py    ~340 lines   Msg, Block, segments, render — zero dependencies
+    llm.py       ~385 lines   complete, extract, act, CostTracker — anthropic SDK
+    flow.py      ~980 lines   9 flow patterns + compaction + events
     display.py   ~310 lines   Trace, LiveFlowDisplay — rich (optional)
 ```
 
-Total: ~1800 lines. 33 tests (including property-based tests via Hypothesis) verify the monoid laws and render homomorphism.
+Total: ~2000 lines. 90 tests (including property-based tests via Hypothesis) verify the monoid laws, render homomorphism, compaction integrity, and all flow patterns.
