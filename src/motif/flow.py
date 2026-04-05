@@ -433,8 +433,6 @@ async def tree(
     leaf_fn: Callable[[str], Msg],
     merge_fn: Callable[[list[str], list[str]], Msg],
     *,
-    is_leaf_key: str = "is_leaf",
-    subtasks_key: str = "subtasks",
     max_depth: int = 3,
     model_split: str = _CHEAP,
     model_leaf: str = llm.DEFAULT_MODEL,
@@ -444,13 +442,19 @@ async def tree(
 ) -> str:
     """Recursive decomposition. Split until leaves, work leaves, merge up.
 
-    split_fn(task) → Msg. split_schema has is_leaf (bool) and subtasks fields.
+    The splitter returns paragraph ranges, not reproduced text. The
+    original text is sliced by the framework — no JSON reproduction of
+    large documents.
+
+    split_fn(task) → Msg asking the model to split or analyze as-is.
+    split_schema must have:
+        is_leaf: bool
+        subtasks: [{label: str, start_paragraph: int, end_paragraph: int}]
     leaf_fn(task) → Msg for leaf-level work.
     merge_fn(results, labels) → Msg for combining child results.
-        Use Block.join(results, labels=labels) to compose them.
 
         result = await tree(
-            task="Analyze this 50-page document",
+            task=long_document,
             split_fn=lambda t: splitter | user(t),
             split_schema=SPLIT_SCHEMA,
             leaf_fn=lambda t: worker | user(t),
@@ -472,15 +476,14 @@ async def tree(
     decision = await llm.extract(split_fn(task), schema=split_schema,
                                  model=model_split)
 
-    if decision.get(is_leaf_key, True):
+    if decision.get("is_leaf", True):
         result = await llm.complete(leaf_fn(task), model=model_leaf)
         elapsed = time.monotonic() - t0
         _emit(FlowEvent("complete", label, _depth,
                          result=_truncate(result), elapsed=elapsed))
         return result
 
-    # Split
-    subtasks = decision.get(subtasks_key, [])
+    subtasks = decision.get("subtasks", [])
     if not subtasks or len(subtasks) < 2:
         result = await llm.complete(leaf_fn(task), model=model_leaf)
         elapsed = time.monotonic() - t0
@@ -488,14 +491,29 @@ async def tree(
                          result=_truncate(result), elapsed=elapsed))
         return result
 
-    # Extract labels for display
-    if isinstance(subtasks[0], dict):
-        child_labels = [s.get("label", s.get("name", f"part_{i}"))
-                        for i, s in enumerate(subtasks)]
-        child_texts = [s.get("text", str(s)) for s in subtasks]
-    else:
-        child_labels = [f"part_{i}" for i in range(len(subtasks))]
-        child_texts = [str(s) for s in subtasks]
+    # Slice the original text by paragraph ranges — no text in JSON
+    paragraphs = task.split("\n\n")
+    child_labels = []
+    child_texts = []
+
+    for s in subtasks:
+        clabel = s.get("label", s.get("name", f"part_{len(child_labels)}"))
+        child_labels.append(clabel)
+
+        if "text" in s:
+            # Backwards compat: if the model returned full text, use it
+            child_texts.append(s["text"])
+        elif "start_paragraph" in s:
+            start = s.get("start_paragraph", 0)
+            end = s.get("end_paragraph", len(paragraphs))
+            child_texts.append("\n\n".join(paragraphs[start:end]))
+        else:
+            # Fallback: even split
+            n = len(subtasks)
+            chunk = len(paragraphs) // n
+            i = len(child_texts)
+            child_texts.append("\n\n".join(
+                paragraphs[i * chunk : (i + 1) * chunk if i < n - 1 else len(paragraphs)]))
 
     _emit(FlowEvent("split", label, _depth, children=child_labels,
                      elapsed=time.monotonic() - t0))
@@ -504,7 +522,6 @@ async def tree(
     child_results = await asyncio.gather(*[
         tree(
             text, split_fn, split_schema, leaf_fn, merge_fn,
-            is_leaf_key=is_leaf_key, subtasks_key=subtasks_key,
             max_depth=max_depth, model_split=model_split,
             model_leaf=model_leaf, model_merge=model_merge,
             label=clabel, _depth=_depth + 1,
