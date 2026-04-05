@@ -835,6 +835,8 @@ async def agent(
 
         if result.done:
             # Model returned final text — natural finish
+            if result.text:
+                msg = msg | assistant(result.text)
             elapsed = time.monotonic() - t0
             _emit(FlowEvent("complete", step_label, 1,
                              result=_truncate(result.text or ""), elapsed=elapsed))
