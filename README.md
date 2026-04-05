@@ -134,6 +134,26 @@ Flow
 | `blackboard` | Expert panel with shared state and selective visibility (`filter_fn`) |
 | `agent` | Tool-use loop — the Msg grows until a signal tool fires |
 
+## Why it composes
+
+The [capstone example](examples/agent_compose.py) puts flow patterns inside agent tool handlers — a blackboard discussion running inside a tool call, inside an agent loop — and it [works on the first run](examples/output/agent_compose.md):
+
+```
+research analyst (agent loop)
+  step 1:
+    → model calls expert_panel tool
+      → blackboard(4 experts × 2 rounds)       ← flow pattern inside tool handler
+        → 8 parallel LLM calls
+      → returns discussion to agent
+  step 2:
+    → model does web search (server-side)       ← Anthropic's tool, transparent
+    → model writes 3000-word sourced report
+```
+
+The reason this composes without debugging is that there's nothing to compose. A tool handler is an async function that takes a dict and returns a string. Inside, `flow.blackboard()` builds its own Msgs from scratch — they're independent of the agent's Msg. When the handler returns, the result becomes a `tool_result` segment in the agent's Msg. The two histories never interact. They can't conflict because they're in different scopes.
+
+The Msg monoid is load-bearing here: the agent's Msg grows with `|`. Inside the tool handler, the flow pattern's Msgs are separate values. There's no "agent context" to thread through, no "flow executor" that needs to know it's nested, no shared mutable state. It's just functions calling functions.
+
 ## Why it works
 
 Msg is a monoid: `|` is associative, `Msg()` is the identity. Block is a second monoid. `render()` is a homomorphism to API payloads. The reason composition feels right is that it *is* right — the operations mean what they look like they mean because the underlying structure is algebraic.
