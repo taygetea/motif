@@ -65,53 +65,47 @@ class StreamPanel(Widget):
     def __init__(self, label: str, **kwargs):
         super().__init__(**kwargs)
         self._label = label
-        self._stream = None
         self._md = None
         self._status_widget = None
         self._text = ""
-        self._buffer: list[str] = []  # chunks before mount
         self._mounted = False
+        self._dirty = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._label, classes="panel-label")
         yield Static("waiting...", classes="panel-status", id="status")
         yield VerticalScroll(Markdown(""))
 
-    async def on_mount(self):
+    def on_mount(self):
         self._md = self.query_one(Markdown)
         self._status_widget = self.query_one("#status", Static)
-        self._stream = Markdown.get_stream(self._md)
         self._mounted = True
-        # Flush any chunks that arrived before mount
-        for chunk in self._buffer:
-            await self._stream.write(chunk)
-        self._buffer.clear()
+        # Flush anything buffered before mount
+        if self._text and self._md:
+            self._md.update(self._text)
 
     def write_chunk_sync(self, text: str):
-        """Write a streaming chunk. Buffers if not yet mounted."""
+        """Write a streaming chunk. Works synchronously."""
         self._text += text
-        if self._mounted and self._stream:
-            self._stream.write(text)
-        else:
-            self._buffer.append(text)
+        if self._mounted and self._md:
+            # update() is sync — triggers a re-render on next frame
+            self._md.update(self._text)
+
+    def get_text(self) -> str:
+        return self._text
 
     def set_status(self, text: str):
         if self._status_widget:
             self._status_widget.update(text)
 
-    async def mark_complete(self, elapsed: float = 0):
-        if self._stream:
-            await self._stream.stop()
+    def mark_complete(self, elapsed: float = 0):
         self.set_status(f"done ({elapsed:.1f}s)")
 
-    async def reset(self):
+    def reset(self):
         """Clear for a new turn."""
         self._text = ""
-        if self._stream:
-            await self._stream.stop()
         if self._md:
-            await self._md.update("")
-            self._stream = Markdown.get_stream(self._md)
+            self._md.update("")
         self.set_status("streaming...")
 
 
@@ -283,8 +277,7 @@ class FlowApp(App):
                         event.label, children,
                         id=f"row-{_safe_id(event.label)}")
                     # Register panels NOW so chunks can find them.
-                    # The StreamPanel objects exist; their _stream will
-                    # buffer chunks until on_mount fires.
+                    # StreamPanel buffers text until on_mount.
                     for name, panel in row.panels.items():
                         self._panels[name] = panel
                     self._main.mount(row)

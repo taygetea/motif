@@ -326,7 +326,10 @@ async def fan(
             streaming=True,
         )
     """
+    child_labels = [_item_label(item, i) for i, item in enumerate(items)]
     _emit(FlowEvent("start", label, depth, meta={"count": len(items), "model": model}))
+    _emit(FlowEvent("split", label, depth, children=child_labels,
+                     meta={"count": len(items), "model": model}))
     t0 = time.monotonic()
     sem = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
