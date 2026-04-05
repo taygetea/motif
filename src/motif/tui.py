@@ -229,13 +229,20 @@ class FlowApp(App):
         self._main = self.query_one("#main", VerticalScroll)
         self._status = self.query_one("#status", StatusBar)
         if self._pipeline_fn:
-            self.run_worker(self._run_pipeline())
+            self._start_pipeline()
 
     def run_pipeline(self, fn):
         """Set the pipeline to run on mount. fn is an async callable."""
         self._pipeline_fn = fn
 
-    async def _run_pipeline(self):
+    @work(thread=False)
+    async def _start_pipeline(self):
+        """Run the pipeline in the main async loop (not a thread).
+
+        This is critical: LLM calls are async and need the event loop.
+        Running in-loop means the pipeline shares the event loop with
+        Textual's rendering, so observers fire in the right context.
+        """
         try:
             if self._status:
                 self._status.update("running...")
@@ -245,27 +252,14 @@ class FlowApp(App):
         except Exception as e:
             if self._status:
                 self._status.update(f"error: {e}")
-            raise
 
     def flow_observer(self, event: FlowEvent):
-        """Attach to flow.observe(). Builds layout from topology."""
-        # We're called from within the async loop (same thread as Textual),
-        # so we can post messages directly.
-        self.post_message(self._FlowEventMsg(event))
+        """Attach to flow.observe(). Builds layout from topology.
 
-    class _FlowEventMsg(Message):
-        def __init__(self, event: FlowEvent):
-            super().__init__()
-            self.event = event
-
-    class _ChunkMsg(Message):
-        def __init__(self, node: str, text: str):
-            super().__init__()
-            self.node = node
-            self.text = text
-
-    def on__flow_event_msg(self, message: _FlowEventMsg):
-        event = message.event
+        Called from within the same async loop as Textual (because
+        the pipeline runs with thread=False), so direct widget
+        manipulation is safe.
+        """
         match event.kind:
             case "split":
                 children = event.children or []
@@ -274,8 +268,12 @@ class FlowApp(App):
                         event.label, children,
                         id=f"row-{_safe_id(event.label)}")
                     self._main.mount(row)
-                    for name, panel in row.panels.items():
-                        self._panels[name] = panel
+                    # Panels aren't available until after mount completes,
+                    # so register them with a callback
+                    def _register(r=row):
+                        for name, panel in r.panels.items():
+                            self._panels[name] = panel
+                    self.call_later(_register)
                 if self._status:
                     self._status.update(f"◆ {event.label} → {len(children)} branches")
 
@@ -285,8 +283,10 @@ class FlowApp(App):
                         event.label,
                         id=f"single-{_safe_id(event.label)}")
                     self._main.mount(single)
-                    if single.panel:
-                        self._panels[event.label] = single.panel
+                    def _register(s=single, lbl=event.label):
+                        if s.panel:
+                            self._panels[lbl] = s.panel
+                    self.call_later(_register)
 
                 panel = self._panels.get(event.label)
                 if panel:
@@ -308,18 +308,17 @@ class FlowApp(App):
                         f"⇐ {event.label}",
                         id=f"merge-{_safe_id(event.label)}")
                     self._main.mount(single)
-                    if single.panel:
-                        self._panels[f"⇐ {event.label}"] = single.panel
-                        single.panel.set_status(f"done ({event.elapsed:.1f}s)")
+                    def _register(s=single, lbl=f"⇐ {event.label}", r=event.result, el=event.elapsed):
+                        if s.panel:
+                            self._panels[lbl] = s.panel
+                            s.panel.set_status(f"done ({el:.1f}s)")
+                    self.call_later(_register)
 
     def llm_observer(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
         """Attach to llm.observe(). Routes chunks to panels."""
         if verb == "chunk":
             node = meta.get("node")
             if node:
-                self.post_message(self._ChunkMsg(node, result))
-
-    def on__chunk_msg(self, message: _ChunkMsg):
-        panel = self._panels.get(message.node)
-        if panel and panel._stream:
-            panel._stream.write(message.text)
+                panel = self._panels.get(node)
+                if panel and panel._stream:
+                    panel._stream.write(result)
