@@ -69,22 +69,31 @@ class StreamPanel(Widget):
         self._md = None
         self._status_widget = None
         self._text = ""
+        self._buffer: list[str] = []  # chunks before mount
+        self._mounted = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._label, classes="panel-label")
         yield Static("waiting...", classes="panel-status", id="status")
         yield VerticalScroll(Markdown(""))
 
-    def on_mount(self):
+    async def on_mount(self):
         self._md = self.query_one(Markdown)
         self._status_widget = self.query_one("#status", Static)
         self._stream = Markdown.get_stream(self._md)
+        self._mounted = True
+        # Flush any chunks that arrived before mount
+        for chunk in self._buffer:
+            await self._stream.write(chunk)
+        self._buffer.clear()
 
-    async def write_chunk(self, text: str):
-        """Write a streaming chunk."""
+    def write_chunk_sync(self, text: str):
+        """Write a streaming chunk. Buffers if not yet mounted."""
         self._text += text
-        if self._stream:
-            await self._stream.write(text)
+        if self._mounted and self._stream:
+            self._stream.write(text)
+        else:
+            self._buffer.append(text)
 
     def set_status(self, text: str):
         if self._status_widget:
@@ -267,13 +276,12 @@ class FlowApp(App):
                     row = PanelRow(
                         event.label, children,
                         id=f"row-{_safe_id(event.label)}")
+                    # Register panels NOW so chunks can find them.
+                    # The StreamPanel objects exist; their _stream will
+                    # buffer chunks until on_mount fires.
+                    for name, panel in row.panels.items():
+                        self._panels[name] = panel
                     self._main.mount(row)
-                    # Panels aren't available until after mount completes,
-                    # so register them with a callback
-                    def _register(r=row):
-                        for name, panel in r.panels.items():
-                            self._panels[name] = panel
-                    self.call_later(_register)
                 if self._status:
                     self._status.update(f"◆ {event.label} → {len(children)} branches")
 
@@ -282,11 +290,9 @@ class FlowApp(App):
                     single = SinglePanel(
                         event.label,
                         id=f"single-{_safe_id(event.label)}")
+                    if single.panel:
+                        self._panels[event.label] = single.panel
                     self._main.mount(single)
-                    def _register(s=single, lbl=event.label):
-                        if s.panel:
-                            self._panels[lbl] = s.panel
-                    self.call_later(_register)
 
                 panel = self._panels.get(event.label)
                 if panel:
@@ -307,12 +313,11 @@ class FlowApp(App):
                     single = SinglePanel(
                         f"⇐ {event.label}",
                         id=f"merge-{_safe_id(event.label)}")
+                    if single.panel:
+                        self._panels[f"⇐ {event.label}"] = single.panel
+                        single.panel.write_chunk_sync(event.result)
+                        single.panel.set_status(f"done ({event.elapsed:.1f}s)")
                     self._main.mount(single)
-                    def _register(s=single, lbl=f"⇐ {event.label}", r=event.result, el=event.elapsed):
-                        if s.panel:
-                            self._panels[lbl] = s.panel
-                            s.panel.set_status(f"done ({el:.1f}s)")
-                    self.call_later(_register)
 
     def llm_observer(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
         """Attach to llm.observe(). Routes chunks to panels."""
@@ -320,5 +325,5 @@ class FlowApp(App):
             node = meta.get("node")
             if node:
                 panel = self._panels.get(node)
-                if panel and panel._stream:
-                    panel._stream.write(result)
+                if panel:
+                    panel.write_chunk_sync(result)
