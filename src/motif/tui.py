@@ -23,6 +23,7 @@ from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll, HorizontalScroll
+from textual.message import Message
 from textual.widgets import Header, Footer, Static, Markdown, Rule
 from textual.widget import Widget
 from textual import work
@@ -252,12 +253,12 @@ class FlowApp(App):
         # so we can post messages directly.
         self.post_message(self._FlowEventMsg(event))
 
-    class _FlowEventMsg(App.Message):
+    class _FlowEventMsg(Message):
         def __init__(self, event: FlowEvent):
             super().__init__()
             self.event = event
 
-    class _ChunkMsg(App.Message):
+    class _ChunkMsg(Message):
         def __init__(self, node: str, text: str):
             super().__init__()
             self.node = node
