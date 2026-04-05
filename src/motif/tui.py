@@ -285,7 +285,12 @@ class FlowApp(App):
                     self._status.update(f"◆ {event.label} → {len(children)} branches")
 
             case "start":
-                if event.label not in self._panels and self._main:
+                # Skip parent nodes that are about to split — the split
+                # handler creates the PanelRow. "count" in meta means
+                # this is a fan/branch parent, not a leaf.
+                if event.meta.get("count"):
+                    pass
+                elif event.label not in self._panels and self._main:
                     single = SinglePanel(
                         event.label,
                         id=f"single-{_safe_id(event.label)}")
