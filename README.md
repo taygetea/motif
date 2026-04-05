@@ -142,7 +142,7 @@ Msg is a monoid: `|` is associative, `Msg()` is the identity. Block is a second 
 
 **The call site is the documentation.** `branch → fan → reduce` says what it does. The pipeline code reads as a description of what it does, not how it manages concurrency or formats prompts.
 
-**Observers observe; they don't intervene.** The pipeline stays pure. Display, logging, tracing — all through observers. Cost tracking, retries — that's middleware, a separate concern.
+**Observers observe; they don't intervene.** The pipeline stays pure. Display, logging, tracing — all through observers. Cost tracking, retries — that's middleware, a separate concern. Observer lists are module-level global state — ergonomic for scripts, but shared across concurrent pipelines. If you need isolation (e.g., a server), this is the seam where an explicit Runtime object would go.
 
 **Compaction is invisible.** The agent loop automatically summarizes older turns when approaching context limits. The user never thinks about it.
 
@@ -188,4 +188,4 @@ src/motif/
     display.py   ~310 lines   Trace, LiveFlowDisplay — rich (optional)
 ```
 
-Total: ~1800 lines. 33 property-based tests verify the monoid laws and render homomorphism.
+Total: ~1800 lines. 33 tests (including property-based tests via Hypothesis) verify the monoid laws and render homomorphism.

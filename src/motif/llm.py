@@ -22,6 +22,15 @@ from .prompt import Msg, render
 # Load .env from the project root (or any parent). Does nothing if no .env exists.
 load_dotenv()
 
+# Detect SDK support for output_config (added in ~0.80) once at import time,
+# not per-call via try/except TypeError which would mask unrelated TypeErrors.
+_HAS_OUTPUT_CONFIG = hasattr(anthropic, "NOT_GIVEN")  # proxy for modern SDK
+try:
+    from packaging.version import Version
+    _HAS_OUTPUT_CONFIG = Version(anthropic.__version__) >= Version("0.80")
+except Exception:
+    pass  # packaging not available — use the hasattr heuristic
+
 _client: anthropic.AsyncAnthropic | None = None
 _observers: list[Callable] = []
 
@@ -44,15 +53,33 @@ def _notify(verb: str, msg: Msg, result: Any, model: str, meta: dict):
             pass  # observers should not break the pipeline
 
 
+_max_retries = 3
+
+
+def configure(*, max_retries: int | None = None, model: str | None = None):
+    """Configure the LLM client. Call before first API use.
+
+        llm.configure(model="claude-opus-4-6")     # upgrade default
+        llm.configure(max_retries=5)
+    """
+    global _max_retries, _client, DEFAULT_MODEL
+    if max_retries is not None:
+        _max_retries = max_retries
+        _client = None  # force re-creation with new settings
+    if model is not None:
+        DEFAULT_MODEL = model
+
+
 def _get_client() -> anthropic.AsyncAnthropic:
     global _client
     if _client is None:
-        # anthropic SDK reads ANTHROPIC_API_KEY from env automatically
-        _client = anthropic.AsyncAnthropic()
+        # anthropic SDK reads ANTHROPIC_API_KEY from env automatically.
+        # max_retries handles 429, 529, and transient 500s with backoff.
+        _client = anthropic.AsyncAnthropic(max_retries=_max_retries)
     return _client
 
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_CHEAP_MODEL = "claude-haiku-4-5"  # used by flow.py for structural decisions
 DEFAULT_MAX_TOKENS = 16000
 
@@ -120,8 +147,7 @@ async def extract(
     if temperature is not None:
         kwargs["temperature"] = temperature
 
-    # Try output_config (SDK >= 0.80), fall back to tool use
-    try:
+    if _HAS_OUTPUT_CONFIG:
         kwargs["output_config"] = {
             "format": {
                 "type": "json_schema",
@@ -136,12 +162,8 @@ async def extract(
                 return result
         raise ValueError("No text block in structured response")
 
-    except TypeError as e:
-        # Older SDK doesn't support output_config — fall back to tool use.
-        # Log the original error so schema issues don't vanish silently.
-        import warnings
-        warnings.warn(f"output_config not supported ({e}), falling back to tool use")
-        del kwargs["output_config"]
+    else:
+        # Older SDK — forced tool use as structured output
         tool_name = "structured_output"
         kwargs["tools"] = [{
             "name": tool_name,
@@ -174,10 +196,12 @@ class ActResult:
     """What act() returned — either a final answer or tool calls.
 
     Check .done to see if the model finished, or .tool_calls for
-    what it wants to invoke next.
+    what it wants to invoke next. stop_reason is the raw API signal:
+    "end_turn", "tool_use", or "max_tokens" (truncated).
     """
     text: str | None = None
     tool_calls: list[ToolRequest] = field(default_factory=list)
+    stop_reason: str | None = None
 
     @property
     def done(self) -> bool:
@@ -244,7 +268,11 @@ async def act(
             ))
 
     text = "\n".join(text_parts) if text_parts else None
-    result = ActResult(text=text, tool_calls=tool_calls)
+    result = ActResult(
+        text=text,
+        tool_calls=tool_calls,
+        stop_reason=getattr(response, "stop_reason", None),
+    )
 
     _notify("act", msg, result, model, meta or {})
     return result

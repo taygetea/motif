@@ -77,7 +77,13 @@ MODEL = "claude-sonnet-4-6"
 
 
 def annotate_paragraphs(text: str) -> str:
-    """Add paragraph numbers so the splitter can reference them."""
+    """Add paragraph numbers so the splitter can reference them.
+
+    Paragraphs are defined as \\n\\n-separated chunks. This is a simple
+    heuristic — texts with \\n\\n inside quoted passages or code blocks
+    will split at those points too. For such texts, use a format-aware
+    splitter instead.
+    """
     paragraphs = text.split("\n\n")
     lines = []
     for i, p in enumerate(paragraphs):

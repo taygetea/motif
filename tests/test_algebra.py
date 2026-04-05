@@ -93,8 +93,7 @@ class TestBlockMonoid:
     @given(a=block_text, b=block_text, c=block_text)
     def test_associativity(self, a, b, c):
         """(Block(a) + Block(b)) + Block(c) == Block(a) + (Block(b) + Block(c))
-        when all are non-empty"""
-        assume(a and b and c)
+        Universal — holds for empty and non-empty strings."""
         left = (Block(a) + Block(b)) + Block(c)
         right = Block(a) + (Block(b) + Block(c))
         assert left == right

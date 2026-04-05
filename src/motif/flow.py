@@ -29,7 +29,7 @@ from typing import Callable, Any
 
 from .prompt import (
     Msg, Block, TextSegment, ToolCall, ToolResult,
-    system, user, tool_use, tool_result,
+    system, user, assistant, tool_use, tool_result,
 )
 from . import llm
 
@@ -160,18 +160,52 @@ async def compact(
     if len(rest) <= keep_recent:
         return msg  # not enough to compact
 
-    to_compact = rest[:-keep_recent]
-    to_keep = rest[-keep_recent:]
+    # Find the split point, then expand to preserve tool_use/tool_result pairs.
+    # A tool_result must reference an existing tool_use in the same conversation,
+    # so we never split a pair across the compaction boundary.
+    split_at = len(rest) - keep_recent
+
+    # Collect all tool_use IDs in the kept tail
+    tail_tool_result_ids = set()
+    tail_tool_use_ids = set()
+    for seg in rest[split_at:]:
+        if isinstance(seg, ToolResult):
+            tail_tool_result_ids.add(seg.tool_use_id)
+        elif isinstance(seg, ToolCall):
+            tail_tool_use_ids.add(seg.id)
+
+    # Pull any tool_use referenced by a kept tool_result into the tail
+    # Pull any tool_result referencing a kept tool_use into the tail
+    while split_at > 0:
+        seg = rest[split_at - 1]
+        pull = False
+        if isinstance(seg, ToolCall) and seg.id in tail_tool_result_ids:
+            pull = True
+            tail_tool_use_ids.add(seg.id)
+        elif isinstance(seg, ToolResult) and seg.tool_use_id in tail_tool_use_ids:
+            pull = True
+            tail_tool_result_ids.add(seg.tool_use_id)
+        if pull:
+            split_at -= 1
+        else:
+            break
+
+    to_compact = rest[:split_at]
+    to_keep = rest[split_at:]
+
+    if not to_compact:
+        return msg  # nothing safe to compact
 
     # Render the compactable segments as text for the summarizer
     lines = []
     for seg in to_compact:
-        if isinstance(seg, TextSegment):
-            lines.append(f"[{seg.role}]: {seg.text}")
-        elif isinstance(seg, ToolCall):
-            lines.append(f"[tool_use: {seg.name}]: {str(seg.input)[:500]}")
-        elif isinstance(seg, ToolResult):
-            lines.append(f"[tool_result]: {seg.content[:500]}")
+        match seg:
+            case TextSegment(role=role, text=text):
+                lines.append(f"[{role}]: {text}")
+            case ToolCall(name=name, input=inp):
+                lines.append(f"[tool_use: {name}]: {str(inp)[:500]}")
+            case ToolResult(content=content):
+                lines.append(f"[tool_result]: {content[:500]}")
 
     history_text = "\n\n".join(lines)
 
@@ -391,16 +425,18 @@ async def cascade(
     """
     _emit(FlowEvent("start", label, depth, meta={"models": models}))
     t0 = time.monotonic()
+    used_model = models[-1]  # fallback
+    result = ""
 
-    for model in models:
-        _emit(FlowEvent("start", model, depth + 1))
+    for used_model in models:
+        _emit(FlowEvent("start", used_model, depth + 1))
         t1 = time.monotonic()
 
-        result = await llm.complete(msg, model=model)
+        result = await llm.complete(msg, model=used_model)
 
-        if model == models[-1]:  # last model — accept regardless
+        if used_model == models[-1]:  # last model — accept regardless
             elapsed = time.monotonic() - t1
-            _emit(FlowEvent("complete", model, depth + 1,
+            _emit(FlowEvent("complete", used_model, depth + 1,
                              result=_truncate(result), elapsed=elapsed))
             break
 
@@ -409,17 +445,17 @@ async def cascade(
         elapsed = time.monotonic() - t1
 
         if judgment.get("sufficient", False):
-            _emit(FlowEvent("complete", model, depth + 1,
+            _emit(FlowEvent("complete", used_model, depth + 1,
                              result=_truncate(result), elapsed=elapsed))
             break
         else:
-            _emit(FlowEvent("complete", model, depth + 1,
+            _emit(FlowEvent("complete", used_model, depth + 1,
                              result="insufficient — escalating", elapsed=elapsed))
 
     total = time.monotonic() - t0
     _emit(FlowEvent("complete", label, depth, elapsed=total,
-                     result=f"settled on {model}", meta={"model_used": model}))
-    return result, model
+                     result=f"settled on {used_model}", meta={"model_used": used_model}))
+    return result, used_model
 
 
 # ---------------------------------------------------------------------------
@@ -444,12 +480,14 @@ async def tree(
 
     The splitter returns paragraph ranges, not reproduced text. The
     original text is sliced by the framework — no JSON reproduction of
-    large documents.
+    large documents. Paragraphs are \\n\\n-separated chunks of the input.
 
     split_fn(task) → Msg asking the model to split or analyze as-is.
     split_schema must have:
         is_leaf: bool
         subtasks: [{label: str, start_paragraph: int, end_paragraph: int}]
+    Also accepts subtasks with "text" field for backward compat or
+    custom splitting that doesn't use paragraph ranges.
     leaf_fn(task) → Msg for leaf-level work.
     merge_fn(results, labels) → Msg for combining child results.
 
@@ -657,15 +695,17 @@ async def blackboard(
 
     for round_num in range(rounds):
         round_label = f"round {round_num + 1}"
-        _emit(FlowEvent("start", round_label, depth + 1, children=agent_names))
+        round_children = [f"{n} (r{round_num + 1})" for n in agent_names]
+        _emit(FlowEvent("start", round_label, depth + 1, children=round_children))
 
         async def _agent_call(name, fn, full_board, hist, rnd):
             visible = filter_fn(full_board, hist, name, rnd) if filter_fn else full_board
-            _emit(FlowEvent("start", name, depth + 2, meta={"round": rnd}))
+            node_label = f"{name} (r{rnd})"
+            _emit(FlowEvent("start", node_label, depth + 2, meta={"round": rnd}))
             t0 = time.monotonic()
             result = await llm.complete(fn(visible), model=model)
             elapsed = time.monotonic() - t0
-            _emit(FlowEvent("complete", name, depth + 2,
+            _emit(FlowEvent("complete", node_label, depth + 2,
                              result=_truncate(result), elapsed=elapsed))
             return result
 
@@ -722,6 +762,7 @@ async def agent(
     model: str = llm.DEFAULT_MODEL,
     max_steps: int = 20,
     max_tokens: int = 100_000,
+    timeout: float | None = None,
     label: str = "agent",
 ) -> AgentResult:
     """Run an agent loop. The Msg grows until the model finishes or
@@ -732,6 +773,8 @@ async def agent(
 
     tool_schemas: [{"name": ..., "description": ..., "input_schema": ...}, ...]
         Tool definitions sent to the model (Anthropic format).
+
+    timeout: wall-clock seconds for the entire agent run. None = no limit.
 
     signal_tools: {name: signal_type}
         Tools whose invocation breaks the loop instead of appending
@@ -757,6 +800,19 @@ async def agent(
     t_total = time.monotonic()
 
     for step in range(max_steps):
+        # Wall-clock timeout
+        if timeout and (time.monotonic() - t_total) > timeout:
+            total = time.monotonic() - t_total
+            _emit(FlowEvent("complete", label, 0, elapsed=total,
+                             result=f"timeout ({timeout}s)",
+                             meta={"steps": step, "signal": "timeout"}))
+            return AgentResult(
+                output=result.text if step > 0 and result else "",
+                signal="timeout",
+                msg=msg,
+                steps=step,
+            )
+
         # Silent compaction — user never thinks about context limits
         if max_tokens:
             msg = await compact(msg, max_tokens=max_tokens)
@@ -766,6 +822,16 @@ async def agent(
         t0 = time.monotonic()
 
         result = await llm.act(msg, tool_schemas, model=model)
+
+        if result.stop_reason == "max_tokens":
+            # Truncated — warn and continue so the model can finish
+            import warnings
+            warnings.warn(f"agent step {step + 1}: response truncated (max_tokens)")
+            _emit(FlowEvent("error", step_label, 1, result="truncated (max_tokens)"))
+            # Append what we got so the model can continue from it
+            if result.text:
+                msg = msg | assistant(result.text)
+            continue
 
         if result.done:
             # Model returned final text — natural finish
@@ -782,6 +848,10 @@ async def agent(
                 msg=msg,
                 steps=step + 1,
             )
+
+        # Preserve assistant narration before tool calls (e.g., "Let me search for that")
+        if result.text:
+            msg = msg | assistant(result.text)
 
         # Process tool calls
         for call in result.tool_calls:
