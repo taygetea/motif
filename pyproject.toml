@@ -1,5 +1,5 @@
 [project]
-name = "motif"
+name = "motif-llm"
 version = "0.1.0"
 description = "A prompt algebra for LLM orchestration. The code reads as its own specification."
 requires-python = ">=3.12"
