@@ -154,11 +154,17 @@ Msg is a monoid: `|` is associative, `Msg()` is the identity. Block is a second 
 ## Installation
 
 ```bash
-pip install motif              # core
-pip install motif[display]     # + live terminal display
+pip install motif-llm              # core
+pip install motif-llm[display]     # + live terminal display
 
 # or with uv
-uv add motif
+uv add motif-llm
+```
+
+Installs as `motif-llm`, imports as `motif`:
+
+```python
+from motif import system, user, flow
 ```
 
 Set `ANTHROPIC_API_KEY` in `.env` or environment. Currently Anthropic-only for LLM calls; `render()` supports OpenAI format for use with your own client.
