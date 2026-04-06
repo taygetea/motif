@@ -222,8 +222,9 @@ class FlowApp(App):
     def __init__(self, title: str = "motif", **kwargs):
         super().__init__(**kwargs)
         self.title = title
-        self._panels: dict[str, StreamPanel] = {}  # label → panel
-        self._pending_splits: dict[str, list[str]] = {}  # parent → children
+        self._panels: dict[str, StreamPanel] = {}      # label → panel
+        self._parallel_groups: dict[str, list[str]] = {} # parent → child labels
+        self._mounted_groups: set[str] = set()           # groups already mounted
         self._main: VerticalScroll | None = None
         self._status: StatusBar | None = None
         self._pipeline_fn = None
@@ -264,54 +265,22 @@ class FlowApp(App):
                 self._status.update(f"error: {e}")
 
     def flow_observer(self, event: FlowEvent):
-        """Attach to flow.observe(). Builds layout from topology.
+        """Flow events provide topology info only — no panels created here.
 
-        Called from within the same async loop as Textual (because
-        the pipeline runs with thread=False), so direct widget
-        manipulation is safe.
+        split events register parallel groups.
+        complete/merge events update panel status.
+        Panels are created by llm_observer when chunks actually arrive.
         """
         match event.kind:
             case "split":
-                # Remember the children. We'll create the PanelRow
-                # when the first child starts (proving they're streaming
-                # nodes, not just data items from branch).
+                # Register that these children are parallel siblings
                 children = event.children or []
                 if children:
-                    self._pending_splits[event.label] = children
+                    self._parallel_groups[event.label] = children
                 if self._status:
-                    self._status.update(f"◆ {event.label} → {len(children)}")
+                    self._status.update(f"◆ {event.label}")
 
             case "start":
-                # Check if this label is a child of a pending split
-                # — if so, create the PanelRow now.
-                for parent, children in list(self._pending_splits.items()):
-                    if event.label in children:
-                        row = PanelRow(
-                            parent, children,
-                            id=f"row-{_safe_id(parent)}")
-                        for name, panel in row.panels.items():
-                            self._panels[name] = panel
-                        if self._main:
-                            self._main.mount(row)
-                        del self._pending_splits[parent]
-                        break
-
-                # If not part of a split and not already tracked,
-                # create a full-width SinglePanel
-                if event.label not in self._panels and self._main:
-                    # Skip structural parents (fan/branch with count)
-                    if not event.meta.get("count"):
-                        single = SinglePanel(
-                            event.label,
-                            id=f"single-{_safe_id(event.label)}")
-                        if single.panel:
-                            self._panels[event.label] = single.panel
-                        self._main.mount(single)
-
-                panel = self._panels.get(event.label)
-                if panel:
-                    panel.set_status("streaming...")
-
                 if self._status:
                     self._status.update(f"● {event.label}")
 
@@ -320,14 +289,47 @@ class FlowApp(App):
                 if panel:
                     panel.set_status(f"done ({event.elapsed:.1f}s)")
                 if self._status:
-                    label = f"⇐ {event.label}" if event.kind == "merge" else event.label
-                    self._status.update(f"✓ {label} ({event.elapsed:.1f}s)")
+                    self._status.update(f"✓ {event.label} ({event.elapsed:.1f}s)")
+
+    def _ensure_panel(self, node: str) -> StreamPanel | None:
+        """Create a panel for this node if it doesn't exist yet.
+
+        If the node belongs to a parallel group, creates a PanelRow
+        for the whole group. Otherwise creates a SinglePanel.
+        """
+        if node in self._panels:
+            return self._panels[node]
+        if not self._main:
+            return None
+
+        # Check if this node is part of a parallel group
+        for parent, children in self._parallel_groups.items():
+            if node in children and parent not in self._mounted_groups:
+                # Create the whole row
+                row = PanelRow(parent, children,
+                               id=f"row-{_safe_id(parent)}")
+                for name, panel in row.panels.items():
+                    self._panels[name] = panel
+                self._main.mount(row)
+                self._mounted_groups.add(parent)
+                return self._panels.get(node)
+
+        # Not parallel — single full-width panel
+        single = SinglePanel(node, id=f"single-{_safe_id(node)}")
+        if single.panel:
+            self._panels[node] = single.panel
+        self._main.mount(single)
+        return self._panels.get(node)
 
     def llm_observer(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
-        """Attach to llm.observe(). Routes chunks to panels."""
+        """LLM events create panels and route chunks.
+
+        Panels are created on first chunk — only nodes that actually
+        produce streaming content get panels. No phantom boxes.
+        """
         if verb == "chunk":
             node = meta.get("node")
             if node:
-                panel = self._panels.get(node)
+                panel = self._ensure_panel(node)
                 if panel:
                     panel.write_chunk_sync(result)
