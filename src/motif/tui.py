@@ -127,8 +127,8 @@ class PanelRow(Widget):
         padding: 0 1;
     }
     PanelRow StreamPanel {
-        width: 40;
-        min-width: 30;
+        width: 80;
+        min-width: 60;
         height: 100%;
     }
     """
