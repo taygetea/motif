@@ -223,6 +223,7 @@ class FlowApp(App):
         super().__init__(**kwargs)
         self.title = title
         self._panels: dict[str, StreamPanel] = {}  # label → panel
+        self._pending_splits: dict[str, list[str]] = {}  # parent → children
         self._main: VerticalScroll | None = None
         self._status: StatusBar | None = None
         self._pipeline_fn = None
@@ -271,32 +272,41 @@ class FlowApp(App):
         """
         match event.kind:
             case "split":
+                # Remember the children. We'll create the PanelRow
+                # when the first child starts (proving they're streaming
+                # nodes, not just data items from branch).
                 children = event.children or []
-                if children and self._main:
-                    row = PanelRow(
-                        event.label, children,
-                        id=f"row-{_safe_id(event.label)}")
-                    # Register panels NOW so chunks can find them.
-                    # StreamPanel buffers text until on_mount.
-                    for name, panel in row.panels.items():
-                        self._panels[name] = panel
-                    self._main.mount(row)
+                if children:
+                    self._pending_splits[event.label] = children
                 if self._status:
-                    self._status.update(f"◆ {event.label} → {len(children)} branches")
+                    self._status.update(f"◆ {event.label} → {len(children)}")
 
             case "start":
-                # Skip parent nodes that are about to split — the split
-                # handler creates the PanelRow. "count" in meta means
-                # this is a fan/branch parent, not a leaf.
-                if event.meta.get("count"):
-                    pass
-                elif event.label not in self._panels and self._main:
-                    single = SinglePanel(
-                        event.label,
-                        id=f"single-{_safe_id(event.label)}")
-                    if single.panel:
-                        self._panels[event.label] = single.panel
-                    self._main.mount(single)
+                # Check if this label is a child of a pending split
+                # — if so, create the PanelRow now.
+                for parent, children in list(self._pending_splits.items()):
+                    if event.label in children:
+                        row = PanelRow(
+                            parent, children,
+                            id=f"row-{_safe_id(parent)}")
+                        for name, panel in row.panels.items():
+                            self._panels[name] = panel
+                        if self._main:
+                            self._main.mount(row)
+                        del self._pending_splits[parent]
+                        break
+
+                # If not part of a split and not already tracked,
+                # create a full-width SinglePanel
+                if event.label not in self._panels and self._main:
+                    # Skip structural parents (fan/branch with count)
+                    if not event.meta.get("count"):
+                        single = SinglePanel(
+                            event.label,
+                            id=f"single-{_safe_id(event.label)}")
+                        if single.panel:
+                            self._panels[event.label] = single.panel
+                        self._main.mount(single)
 
                 panel = self._panels.get(event.label)
                 if panel:
@@ -305,23 +315,13 @@ class FlowApp(App):
                 if self._status:
                     self._status.update(f"● {event.label}")
 
-            case "complete":
+            case "complete" | "merge":
                 panel = self._panels.get(event.label)
                 if panel:
                     panel.set_status(f"done ({event.elapsed:.1f}s)")
-
-            case "merge":
                 if self._status:
-                    self._status.update(f"⇐ {event.label} ({event.elapsed:.1f}s)")
-                if event.result and self._main:
-                    single = SinglePanel(
-                        f"⇐ {event.label}",
-                        id=f"merge-{_safe_id(event.label)}")
-                    if single.panel:
-                        self._panels[f"⇐ {event.label}"] = single.panel
-                        single.panel.write_chunk_sync(event.result)
-                        single.panel.set_status(f"done ({event.elapsed:.1f}s)")
-                    self._main.mount(single)
+                    label = f"⇐ {event.label}" if event.kind == "merge" else event.label
+                    self._status.update(f"✓ {label} ({event.elapsed:.1f}s)")
 
     def llm_observer(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
         """Attach to llm.observe(). Routes chunks to panels."""
