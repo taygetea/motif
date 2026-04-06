@@ -394,7 +394,8 @@ async def reduce(
     t0 = time.monotonic()
 
     combined = _join(results, labels=labels)
-    result = await llm.complete(msg_fn(combined), model=model, **kw)
+    result = await llm.complete(msg_fn(combined), model=model,
+                                 meta={"node": label}, **kw)
 
     elapsed = time.monotonic() - t0
     _emit(FlowEvent("merge", label, depth, result=_truncate(result), elapsed=elapsed))
