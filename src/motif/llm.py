@@ -157,7 +157,10 @@ def _get_client() -> anthropic.AsyncAnthropic:
     if _client is None:
         # anthropic SDK reads ANTHROPIC_API_KEY from env automatically.
         # max_retries handles 429, 529, and transient 500s with backoff.
-        _client = anthropic.AsyncAnthropic(max_retries=_max_retries)
+        _client = anthropic.AsyncAnthropic(
+            max_retries=_max_retries,
+            timeout=600.0,  # 10 minutes — prevents SDK forcing streaming
+        )
     return _client
 
 
