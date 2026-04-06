@@ -47,14 +47,15 @@ class StreamPanel(Widget):
         background: $accent;
         color: $text;
         text-style: bold;
-        padding: 0 1;
+        padding: 0 2;
         height: 1;
     }
     StreamPanel .panel-status {
         dock: top;
         color: $text-muted;
-        padding: 0 1;
+        padding: 0 2;
         height: 1;
+        text-style: italic;
     }
     StreamPanel VerticalScroll {
         height: 1fr;
@@ -212,9 +213,29 @@ class FlowApp(App):
     """
 
     CSS = """
+    #body {
+        height: 1fr;
+    }
     #main {
         height: 1fr;
         overflow-y: auto;
+    }
+    #trace-sidebar {
+        width: 30;
+        dock: left;
+        border-right: solid $accent;
+        overflow-y: auto;
+        padding: 1;
+    }
+    #trace-sidebar Static {
+        width: 100%;
+    }
+    .trace-label {
+        background: $surface;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+        height: 1;
     }
     """
 
@@ -225,6 +246,7 @@ class FlowApp(App):
         self._parallel_groups: dict[str, list[str]] = {} # parent → child labels
         self._mounted_groups: set[str] = set()           # groups already mounted
         self._main: VerticalScroll | None = None
+        self._trace_log: VerticalScroll | None = None
         self._status: StatusBar | None = None
         self._pipeline_fn = None
         self._pipeline_result = None
@@ -232,11 +254,17 @@ class FlowApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield StatusBar("ready", id="status")
-        yield VerticalScroll(id="main")
+        with Horizontal(id="body"):
+            yield VerticalScroll(
+                Static("Flow", classes="trace-label"),
+                id="trace-sidebar",
+            )
+            yield VerticalScroll(id="main")
         yield Footer()
 
     def on_mount(self):
         self._main = self.query_one("#main", VerticalScroll)
+        self._trace_log = self.query_one("#trace-sidebar", VerticalScroll)
         self._status = self.query_one("#status", StatusBar)
         if self._pipeline_fn:
             self._start_pipeline()
@@ -263,32 +291,43 @@ class FlowApp(App):
             if self._status:
                 self._status.update(f"error: {e}")
 
+    def _trace_append(self, text: str):
+        """Add a line to the trace sidebar."""
+        if self._trace_log:
+            self._trace_log.mount(Static(text))
+
     def flow_observer(self, event: FlowEvent):
-        """Flow events provide topology info only — no panels created here.
+        """Flow events provide topology and update the trace sidebar.
 
         split events register parallel groups.
         complete/merge events update panel status.
         Panels are created by llm_observer when chunks actually arrive.
         """
+        indent = "  " * event.depth
         match event.kind:
             case "split":
-                # Register that these children are parallel siblings
                 children = event.children or []
                 if children:
                     self._parallel_groups[event.label] = children
+                n = len(children)
+                self._trace_append(f"{indent}◆ {event.label} → {n}")
                 if self._status:
                     self._status.update(f"◆ {event.label}")
 
             case "start":
+                self._trace_append(f"{indent}● {event.label}")
                 if self._status:
                     self._status.update(f"● {event.label}")
 
             case "complete" | "merge":
+                sym = "✓" if event.kind == "complete" else "⇐"
+                elapsed = f" ({event.elapsed:.1f}s)" if event.elapsed else ""
+                self._trace_append(f"{indent}{sym} {event.label}{elapsed}")
                 panel = self._panels.get(event.label)
                 if panel:
                     panel.set_status(f"done ({event.elapsed:.1f}s)")
                 if self._status:
-                    self._status.update(f"✓ {event.label} ({event.elapsed:.1f}s)")
+                    self._status.update(f"{sym} {event.label}{elapsed}")
 
     def _ensure_panel(self, node: str) -> StreamPanel | None:
         """Create a panel for this node if it doesn't exist yet.
