@@ -38,6 +38,7 @@ class StreamPanel(Widget):
     StreamPanel {
         width: 1fr;
         min-width: 30;
+        max-width: 100;
         height: 1fr;
         border: solid $accent;
         padding: 0 1;
