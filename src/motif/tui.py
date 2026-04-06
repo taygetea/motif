@@ -37,8 +37,6 @@ class StreamPanel(Widget):
     DEFAULT_CSS = """
     StreamPanel {
         width: 1fr;
-        min-width: 30;
-        max-width: 100;
         height: 1fr;
         border: solid $accent;
         padding: 0 1;
@@ -128,8 +126,8 @@ class PanelRow(Widget):
         padding: 0 1;
     }
     PanelRow StreamPanel {
-        width: 80;
-        min-width: 60;
+        width: 1fr;
+        min-width: 50;
         height: 100%;
     }
     """
@@ -158,6 +156,7 @@ class SinglePanel(Widget):
     SinglePanel {
         height: 1fr;
         max-height: 50%;
+        max-width: 100;
     }
     """
 
