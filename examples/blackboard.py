@@ -62,6 +62,7 @@ async def main():
                 ("Philosopher", lambda b: PHILOSOPHER | user(b)),
             ],
             seed=seed,
+            title="expert panel",
             rounds=2,
             model=MODEL,
         )

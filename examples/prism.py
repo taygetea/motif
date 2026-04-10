@@ -83,7 +83,7 @@ async def main():
             ENUMERATOR | user(f"Lenses for:\n\n{doc}"),
             schema=METHODS_SCHEMA,
             model=MODEL,
-            label="discover lenses",
+            title="discover lenses",
         )
 
         analyses = await flow.fan(
@@ -92,14 +92,14 @@ async def main():
                 f"Methodology: {m['name']}\n{m['rationale']}\n\nDocument:\n{doc}"
             ),
             model=MODEL,
-            label="parallel analysis",
+            title="parallel analysis",
         )
 
         synthesis = await flow.reduce(
             analyses,
             lambda combined: SYNTHESIZER | user(combined),
             model=MODEL,
-            label="synthesis",
+            title="synthesis",
         )
 
     flow.clear_observers()

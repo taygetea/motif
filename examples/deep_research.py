@@ -118,7 +118,7 @@ async def research_angle(angle: dict) -> str:
         tool_schemas=[WEB_SEARCH_TOOL],
         model=MODEL,
         max_steps=8,
-        label=angle["name"],
+        title=angle["name"],
     )
     return result.output
 
@@ -140,7 +140,7 @@ async def main():
             DECOMPOSER | user(f"Topic: {topic}"),
             schema=ANGLES_SCHEMA,
             model=MODEL_BRANCH,
-            label="decompose topic",
+            title="decompose topic",
         )
 
         # Phase 2: Research each angle in parallel (agents with web search)
@@ -171,6 +171,7 @@ async def main():
         board, discussion = await flow.blackboard(
             agents=discussants,
             seed=seed_board,
+            title="researcher discussion",
             rounds=2,
             model=MODEL,
         )

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .flow import FlowEvent
+from . import graph
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,16 @@ class Trace:
                 lines.append(f"{prefix}✗ {e.label}: {preview}")
 
         return "\n".join(lines)
+
+    @property
+    def graph(self) -> list[graph.Node]:
+        """The computation graph root nodes.
+
+        Available after running a pipeline. The graph is the structural
+        record — every node, timing, output. Complementary to events
+        (which are the flat timeline).
+        """
+        return graph.root_nodes()
 
     @property
     def total_elapsed(self) -> float:

@@ -69,7 +69,7 @@ async def multi_analyze(inp):
         | user(text),
         schema=LENS_SCHEMA,
         model=MODEL_TOOLS,
-        label="discover lenses",
+        title="discover lenses",
         depth=3,
     )
 
@@ -81,7 +81,7 @@ async def multi_analyze(inp):
             | user(text)
         ),
         model=MODEL_TOOLS,
-        label="apply lenses",
+        title="apply lenses",
         depth=3,
     )
 
@@ -94,7 +94,7 @@ async def multi_analyze(inp):
         ),
         labels=[l["name"] for l in lenses],
         model=MODEL_TOOLS,
-        label="synthesize lenses",
+        title="synthesize lenses",
         depth=3,
     )
 
@@ -122,6 +122,7 @@ async def expert_panel(inp):
     board, history = await flow.blackboard(
         agents=agents,
         seed=f"Discussion topic: {topic}\n\nPlease share your initial perspective.",
+        title="expert panel",
         rounds=2,
         model=MODEL_TOOLS,
         depth=3,
@@ -215,7 +216,7 @@ async def main():
             },
             tool_schemas=TOOL_SCHEMAS,
             model=MODEL_AGENT,
-            label="research analyst",
+            title="research analyst",
         )
 
     flow.clear_observers()

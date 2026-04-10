@@ -22,6 +22,7 @@ from .prompt import (
     Block, Msg, Template, render,
     TextSegment, ToolCall, ToolResult,
 )
+from .graph import Node
 
 __all__ = [
     # Constructors
@@ -30,6 +31,8 @@ __all__ = [
     "Block", "Msg", "Template",
     # Segment types
     "TextSegment", "ToolCall", "ToolResult",
+    # Graph
+    "Node",
     # Rendering
     "render",
 ]

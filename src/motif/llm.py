@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 import anthropic
 
 from .prompt import Msg, render
+from .graph import current_node
 
 # Load .env from the project root (or any parent). Does nothing if no .env exists.
 load_dotenv()
@@ -273,10 +274,13 @@ async def stream(
         kwargs["temperature"] = temperature
 
     _meta = meta or {}
+    node = current_node()  # graph node from flow context, if any
     full_text = []
     async with client.messages.stream(**kwargs) as s:
         async for text in s.text_stream:
             full_text.append(text)
+            if node:
+                node.append_output(text)
             _notify("chunk", msg, text, model, _meta)
             yield text
         response = await s.get_final_message()

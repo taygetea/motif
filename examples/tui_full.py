@@ -13,7 +13,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from motif import system, user, Block
-from motif import llm, flow
+from motif import flow
 from motif.tui import FlowApp
 
 ENUMERATOR = system("""Given a document, identify 4 distinct analytical lenses that would
@@ -65,7 +65,7 @@ async def run_pipeline():
         ENUMERATOR | user(f"Lenses for:\n\n{DOC}"),
         schema=METHODS_SCHEMA,
         model="claude-sonnet-4-6",
-        label="discover lenses",
+        title="discover lenses",
     )
 
     # Step 2: Fan — apply each lens in parallel (horizontal row)
@@ -76,7 +76,7 @@ async def run_pipeline():
         ),
         model="claude-sonnet-4-6",
         streaming=True,
-        label="parallel analysis",
+        title="parallel analysis",
     )
 
     # Step 3: Reduce — synthesize (single panel below)
@@ -86,7 +86,7 @@ async def run_pipeline():
         labels=[m["name"] for m in methods],
         model="claude-sonnet-4-6",
         streaming=True,
-        label="synthesis",
+        title="synthesis",
     )
 
     return synthesis
@@ -94,8 +94,6 @@ async def run_pipeline():
 
 def main():
     app = FlowApp(title="Branch → Fan → Reduce")
-    flow.observe(app.flow_observer)
-    llm.observe(app.llm_observer)
     app.run_pipeline(run_pipeline)
     app.run()
 

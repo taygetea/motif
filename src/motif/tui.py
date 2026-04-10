@@ -1,48 +1,51 @@
 """Textual TUI viewer for streaming flow executions.
 
-Observes both llm (for streaming chunks) and flow (for topology).
-Builds the layout dynamically from flow events:
-  - split → horizontal scrollable row of panels
-  - sequential steps → vertical stacking
-  - chunks routed to panels by node label
+Reads the computation graph directly — no observer wiring needed.
+Panels poll graph nodes for output changes via dirty-checking (_version).
 
     from motif.tui import FlowApp
 
-    app = FlowApp()
-    flow.observe(app.flow_observer)
-    llm.observe(app.llm_observer)
-    app.run_async(your_pipeline())
+    app = FlowApp(title="My Pipeline")
+    app.run_pipeline(my_pipeline)
+    app.run()
+
+The graph builds automatically as flow patterns execute.
+The TUI discovers new nodes by polling graph.root_nodes().
 
 Requires: pip install motif-llm[tui]
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll, HorizontalScroll
-from textual.message import Message
-from textual.widgets import Header, Footer, Static, Markdown, Rule
+from textual.containers import Horizontal, VerticalScroll, HorizontalScroll
+from textual.widgets import Header, Footer, Static, Markdown
 from textual.widget import Widget
 from textual import work
 
-from .flow import FlowEvent
+from . import graph
 
 
-class StreamPanel(Widget):
-    """A labeled panel with streaming markdown content."""
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
+
+class NodePanel(Widget):
+    """A panel that displays a graph node's streaming output.
+
+    Polls node._version every 100ms. When it changes, updates the
+    markdown display and status line. No callbacks, no subscriptions.
+    """
 
     DEFAULT_CSS = """
-    StreamPanel {
+    NodePanel {
         width: 1fr;
         height: 1fr;
         border: solid $accent;
         padding: 0 1;
         overflow-y: auto;
     }
-    StreamPanel .panel-label {
+    NodePanel .panel-label {
         dock: top;
         background: $accent;
         color: $text;
@@ -50,67 +53,59 @@ class StreamPanel(Widget):
         padding: 0 2;
         height: 1;
     }
-    StreamPanel .panel-status {
+    NodePanel .panel-status {
         dock: top;
         color: $text-muted;
         padding: 0 2;
         height: 1;
         text-style: italic;
     }
-    StreamPanel VerticalScroll {
+    NodePanel VerticalScroll {
         height: 1fr;
     }
     """
 
-    def __init__(self, label: str, **kwargs):
+    def __init__(self, node: graph.Node, **kwargs):
         super().__init__(**kwargs)
-        self._label = label
+        self._node = node
+        self._rendered_version = -1
         self._md = None
-        self._status_widget = None
-        self._text = ""
-        self._mounted = False
-        self._dirty = False
 
     def compose(self) -> ComposeResult:
-        yield Static(self._label, classes="panel-label")
-        yield Static("waiting...", classes="panel-status", id="status")
+        yield Static(self._node.title, classes="panel-label")
+        yield Static(self._state_text(), classes="panel-status", id="status")
         yield VerticalScroll(Markdown(""))
 
     def on_mount(self):
         self._md = self.query_one(Markdown)
-        self._status_widget = self.query_one("#status", Static)
-        self._mounted = True
-        # Flush anything buffered before mount
-        if self._text and self._md:
-            self._md.update(self._text)
+        self.set_interval(0.1, self._check)
 
-    def write_chunk_sync(self, text: str):
-        """Write a streaming chunk. Works synchronously."""
-        self._text += text
-        if self._mounted and self._md:
-            # update() is sync — triggers a re-render on next frame
-            self._md.update(self._text)
+    def _check(self):
+        if self._node._version != self._rendered_version:
+            self._rendered_version = self._node._version
+            if self._md and self._node.output:
+                self._md.update(self._node.output)
+            status = self.query_one("#status", Static)
+            status.update(self._state_text())
 
-    def get_text(self) -> str:
-        return self._text
-
-    def set_status(self, text: str):
-        if self._status_widget:
-            self._status_widget.update(text)
-
-    def mark_complete(self, elapsed: float = 0):
-        self.set_status(f"done ({elapsed:.1f}s)")
-
-    def reset(self):
-        """Clear for a new turn."""
-        self._text = ""
-        if self._md:
-            self._md.update("")
-        self.set_status("streaming...")
+    def _state_text(self) -> str:
+        match self._node.state:
+            case "pending":
+                return "waiting..."
+            case "running":
+                return "running..."
+            case "streaming":
+                return "streaming..."
+            case "complete":
+                return f"done ({self._node.elapsed:.1f}s)"
+            case "error":
+                return f"error: {self._node.error or 'unknown'}"
+            case _:
+                return self._node.state
 
 
 class PanelRow(Widget):
-    """A horizontal scrollable row of panels (for parallel branches)."""
+    """A horizontal scrollable row of NodePanels (for fan children)."""
 
     DEFAULT_CSS = """
     PanelRow {
@@ -126,28 +121,23 @@ class PanelRow(Widget):
         color: $text-muted;
         padding: 0 1;
     }
-    PanelRow StreamPanel {
+    PanelRow NodePanel {
         width: 1fr;
         min-width: 50;
         height: 100%;
     }
     """
 
-    def __init__(self, label: str, panel_names: list[str], **kwargs):
+    def __init__(self, title: str, nodes: list[graph.Node], **kwargs):
         super().__init__(**kwargs)
-        self._label = label
-        self._panel_names = panel_names
-        # Create panels NOW so they can buffer chunks before mount
-        self.panels: dict[str, StreamPanel] = {
-            name: StreamPanel(name, id=f"panel-{_safe_id(name)}")
-            for name in panel_names
-        }
+        self._title = title
+        self._graph_nodes = nodes
 
     def compose(self) -> ComposeResult:
-        yield Static(f"◆ {self._label}", classes="row-label")
+        yield Static(f"\u25c6 {self._title}", classes="row-label")
         with HorizontalScroll():
-            for name in self._panel_names:
-                yield self.panels[name]
+            for node in self._graph_nodes:
+                yield NodePanel(node, id=f"panel-{node.id}")
 
 
 class SinglePanel(Widget):
@@ -161,17 +151,16 @@ class SinglePanel(Widget):
     }
     """
 
-    def __init__(self, label: str, **kwargs):
+    def __init__(self, node: graph.Node, **kwargs):
         super().__init__(**kwargs)
-        self._label = label
-        self.panel = StreamPanel(self._label, id=f"panel-{_safe_id(self._label)}")
+        self._node = node
 
     def compose(self) -> ComposeResult:
-        yield self.panel
+        yield NodePanel(self._node, id=f"panel-{self._node.id}")
 
 
 class StatusBar(Static):
-    """Top bar showing current status."""
+    """Top bar showing current pipeline status."""
 
     DEFAULT_CSS = """
     StatusBar {
@@ -184,32 +173,40 @@ class StatusBar(Static):
     """
 
 
-def _safe_id(label: str) -> str:
-    """Convert a label to a valid Textual widget ID."""
-    return label.lower().replace(" ", "-").replace("(", "").replace(")", "")[:30]
+def _safe_id(text: str) -> str:
+    """Make a string safe for use as a Textual widget ID."""
+    return text.lower().replace(" ", "-").replace("(", "").replace(")", "")[:30]
 
+
+# ---------------------------------------------------------------------------
+# Symbols for trace sidebar
+# ---------------------------------------------------------------------------
+
+_STATE_SYM = {
+    "pending": "\u25cb",     # ○
+    "running": "\u25cf",     # ●
+    "streaming": "\u25c6",   # ◆
+    "complete": "\u2713",    # ✓
+    "error": "\u2717",       # ✗
+}
+
+
+# ---------------------------------------------------------------------------
+# FlowApp — the main TUI application
+# ---------------------------------------------------------------------------
 
 class FlowApp(App):
-    """Textual app that builds its layout from flow events.
+    """Textual app that builds its layout from the computation graph.
 
-    Attach as observer to both flow and llm:
+    No observer wiring needed — the app reads graph nodes directly.
 
-        app = FlowApp()
-        flow.observe(app.flow_observer)
-        llm.observe(app.llm_observer)
+        async def pipeline():
+            items = await flow.branch(msg, title="discover", schema=S)
+            return await flow.fan(items, fn, title="analyze")
 
-    Then run your pipeline inside the app:
-
-        async def main():
-            app = FlowApp(title="My Analysis")
-            flow.observe(app.flow_observer)
-            llm.observe(app.llm_observer)
-
-            async def pipeline():
-                return await flow.fan(items, fn, streaming=True)
-
-            app.run_pipeline(pipeline)
-            app.run()
+        app = FlowApp(title="My Analysis")
+        app.run_pipeline(pipeline)
+        app.run()
     """
 
     CSS = """
@@ -224,11 +221,7 @@ class FlowApp(App):
         width: 30;
         dock: left;
         border-right: solid $accent;
-        overflow-y: auto;
         padding: 1;
-    }
-    #trace-sidebar Static {
-        width: 100%;
     }
     .trace-label {
         background: $surface;
@@ -237,19 +230,20 @@ class FlowApp(App):
         padding: 0 1;
         height: 1;
     }
+    #trace-content {
+        width: 100%;
+    }
     """
 
     def __init__(self, title: str = "motif", **kwargs):
         super().__init__(**kwargs)
         self.title = title
-        self._panels: dict[str, StreamPanel] = {}      # label → panel
-        self._parallel_groups: dict[str, list[str]] = {} # parent → child labels
-        self._mounted_groups: set[str] = set()           # groups already mounted
         self._main: VerticalScroll | None = None
-        self._trace_log: VerticalScroll | None = None
         self._status: StatusBar | None = None
+        self._trace_content: Static | None = None
         self._pipeline_fn = None
         self._pipeline_result = None
+        self._seen_nodes: set[str] = set()  # node IDs we've created widgets for
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -257,6 +251,7 @@ class FlowApp(App):
         with Horizontal(id="body"):
             yield VerticalScroll(
                 Static("Flow", classes="trace-label"),
+                Static("", id="trace-content"),
                 id="trace-sidebar",
             )
             yield VerticalScroll(id="main")
@@ -264,8 +259,11 @@ class FlowApp(App):
 
     def on_mount(self):
         self._main = self.query_one("#main", VerticalScroll)
-        self._trace_log = self.query_one("#trace-sidebar", VerticalScroll)
         self._status = self.query_one("#status", StatusBar)
+        self._trace_content = self.query_one("#trace-content", Static)
+        # Poll graph for new nodes and trace updates
+        self.set_interval(0.2, self._poll_graph)
+        self.set_interval(0.5, self._refresh_trace)
         if self._pipeline_fn:
             self._start_pipeline()
 
@@ -275,15 +273,16 @@ class FlowApp(App):
 
     @work(thread=False)
     async def _start_pipeline(self):
-        """Run the pipeline in the main async loop (not a thread).
+        """Run the pipeline in the main async loop.
 
-        This is critical: LLM calls are async and need the event loop.
-        Running in-loop means the pipeline shares the event loop with
-        Textual's rendering, so observers fire in the right context.
+        In-loop so LLM calls share the event loop with Textual's
+        rendering. Graph node updates are immediately visible to polls.
         """
         try:
             if self._status:
                 self._status.update("running...")
+            graph.reset()  # clean slate for this pipeline
+            self._seen_nodes.clear()
             self._pipeline_result = await self._pipeline_fn()
             if self._status:
                 self._status.update("done")
@@ -291,83 +290,88 @@ class FlowApp(App):
             if self._status:
                 self._status.update(f"error: {e}")
 
-    def _trace_append(self, text: str):
-        """Add a line to the trace sidebar."""
-        if self._trace_log:
-            self._trace_log.mount(Static(text))
+    # --- Graph polling ---
 
-    def flow_observer(self, event: FlowEvent):
-        """Flow events provide topology and update the trace sidebar.
+    def _poll_graph(self):
+        """Discover new graph nodes and create widgets for them."""
+        for root in graph.root_nodes():
+            self._visit(root, is_fan_child=False)
 
-        split events register parallel groups.
-        complete/merge events update panel status.
-        Panels are created by llm_observer when chunks actually arrive.
-        """
-        indent = "  " * event.depth
-        match event.kind:
-            case "split":
-                children = event.children or []
-                if children:
-                    self._parallel_groups[event.label] = children
-                n = len(children)
-                self._trace_append(f"{indent}◆ {event.label} → {n}")
+    def _visit(self, node: graph.Node, *, is_fan_child: bool):
+        """Walk the graph, creating widgets for new content nodes."""
+        if node.id in self._seen_nodes:
+            # Already have a widget — but check for new children
+            for child in node.children:
+                child_is_fan = (node.kind == "fan")
+                self._visit(child, is_fan_child=child_is_fan)
+            return
+
+        if node.kind == "fan":
+            # Fan: create a horizontal row once children exist
+            if node.children:
+                self._seen_nodes.add(node.id)
+                for child in node.children:
+                    self._seen_nodes.add(child.id)
+                row = PanelRow(node.title, node.children,
+                               id=f"row-{node.id}")
+                if self._main:
+                    self._main.mount(row)
+                # Update status
                 if self._status:
-                    self._status.update(f"◆ {event.label}")
+                    self._status.update(f"\u25c6 {node.title}")
+            # else: wait for children to appear (next poll)
 
-            case "start":
-                self._trace_append(f"{indent}● {event.label}")
-                if self._status:
-                    self._status.update(f"● {event.label}")
+        elif node.kind == "reduce":
+            self._seen_nodes.add(node.id)
+            panel = SinglePanel(node, id=f"single-{node.id}")
+            if self._main:
+                self._main.mount(panel)
+            if self._status:
+                self._status.update(f"\u25cf {node.title}")
 
-            case "complete" | "merge":
-                sym = "✓" if event.kind == "complete" else "⇐"
-                elapsed = f" ({event.elapsed:.1f}s)" if event.elapsed else ""
-                self._trace_append(f"{indent}{sym} {event.label}{elapsed}")
-                panel = self._panels.get(event.label)
-                if panel:
-                    panel.set_status(f"done ({event.elapsed:.1f}s)")
-                if self._status:
-                    self._status.update(f"{sym} {event.label}{elapsed}")
+        elif node.kind == "call" and not is_fan_child:
+            # Standalone call (not part of a fan — fan children are
+            # handled by PanelRow above)
+            self._seen_nodes.add(node.id)
+            panel = SinglePanel(node, id=f"single-{node.id}")
+            if self._main:
+                self._main.mount(panel)
 
-    def _ensure_panel(self, node: str) -> StreamPanel | None:
-        """Create a panel for this node if it doesn't exist yet.
+        elif node.kind in ("branch", "compact", "step", "tool_call",
+                           "round", "best_of", "cascade", "tournament"):
+            # Structural nodes — no panel, just mark as seen
+            self._seen_nodes.add(node.id)
 
-        If the node belongs to a parallel group, creates a PanelRow
-        for the whole group. Otherwise creates a SinglePanel.
-        """
-        if node in self._panels:
-            return self._panels[node]
-        if not self._main:
-            return None
+        elif node.kind in ("agent", "blackboard", "tree"):
+            # Container nodes — no panel for the container itself,
+            # but recurse into children
+            self._seen_nodes.add(node.id)
+            if self._status:
+                self._status.update(f"\u25cf {node.title}")
 
-        # Check if this node is part of a parallel group
-        for parent, children in self._parallel_groups.items():
-            if node in children and parent not in self._mounted_groups:
-                # Create the whole row
-                row = PanelRow(parent, children,
-                               id=f"row-{_safe_id(parent)}")
-                for name, panel in row.panels.items():
-                    self._panels[name] = panel
-                self._main.mount(row)
-                self._mounted_groups.add(parent)
-                return self._panels.get(node)
+        # Recurse into children we haven't visited
+        for child in node.children:
+            child_is_fan = (node.kind == "fan")
+            self._visit(child, is_fan_child=child_is_fan)
 
-        # Not parallel — single full-width panel
-        single = SinglePanel(node, id=f"single-{_safe_id(node)}")
-        if single.panel:
-            self._panels[node] = single.panel
-        self._main.mount(single)
-        return self._panels.get(node)
+    # --- Trace sidebar ---
 
-    def llm_observer(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
-        """LLM events create panels and route chunks.
+    def _refresh_trace(self):
+        """Rebuild the trace sidebar from the graph tree."""
+        if not self._trace_content:
+            return
+        lines = []
+        for root in graph.root_nodes():
+            self._trace_walk(root, lines, indent=0)
+        self._trace_content.update("\n".join(lines))
 
-        Panels are created on first chunk — only nodes that actually
-        produce streaming content get panels. No phantom boxes.
-        """
-        if verb == "chunk":
-            node = meta.get("node")
-            if node:
-                panel = self._ensure_panel(node)
-                if panel:
-                    panel.write_chunk_sync(result)
+    def _trace_walk(self, node: graph.Node, lines: list[str], indent: int):
+        prefix = "  " * indent
+        sym = _STATE_SYM.get(node.state, "?")
+        elapsed = f" ({node.elapsed:.1f}s)" if node.elapsed else ""
+        title = node.title
+        if len(title) > 25:
+            title = title[:22] + "..."
+        lines.append(f"{prefix}{sym} {title}{elapsed}")
+        for child in node.children:
+            self._trace_walk(child, lines, indent + 1)

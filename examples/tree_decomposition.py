@@ -118,7 +118,7 @@ async def main():
             model_leaf=MODEL,
             model_merge=MODEL,
             max_depth=3,
-            label="Genealogy, First Essay",
+            title="Genealogy, First Essay",
         )
 
     flow.clear_observers()

@@ -8,7 +8,7 @@ import pytest
 
 from motif import system, user, assistant, tool_use, tool_result, Msg, Block
 from motif.prompt import TextSegment, ToolCall, ToolResult as TR
-from motif import flow
+from motif import flow, graph
 from motif.flow import FlowEvent
 from motif.llm import ActResult, ToolRequest
 
@@ -21,6 +21,7 @@ class TestAgentTruncation:
     @pytest.mark.asyncio
     async def test_max_tokens_continues(self):
         """stop_reason='max_tokens' appends partial text and retries."""
+        graph.reset()
         call_count = 0
 
         async def _act(*args, **kwargs):
@@ -46,6 +47,7 @@ class TestAgentTruncation:
     @pytest.mark.asyncio
     async def test_max_tokens_no_text(self):
         """Truncation with no text still continues."""
+        graph.reset()
         call_count = 0
 
         async def _act(*args, **kwargs):
@@ -71,6 +73,7 @@ class TestAgentTimeout:
     @pytest.mark.asyncio
     async def test_timeout_fires(self):
         """Agent returns signal='timeout' when wall clock exceeds limit."""
+        graph.reset()
         async def _slow_act(*args, **kwargs):
             await asyncio.sleep(0.1)
             return ActResult(
@@ -104,6 +107,7 @@ class TestCascade:
     @pytest.mark.asyncio
     async def test_first_model_sufficient(self):
         """If the first model passes, no escalation."""
+        graph.reset()
         with patch("motif.flow.llm.complete", new=AsyncMock(return_value="answer")), \
              patch("motif.flow.llm.extract", new=AsyncMock(return_value={"sufficient": True})):
             result, model_used = await flow.cascade(
@@ -111,6 +115,7 @@ class TestCascade:
                 test_fn=lambda ans: user(ans),
                 test_schema={},
                 models=["cheap", "expensive"],
+                title="t",
             )
         assert result == "answer"
         assert model_used == "cheap"
@@ -118,6 +123,7 @@ class TestCascade:
     @pytest.mark.asyncio
     async def test_escalates_on_insufficient(self):
         """Insufficient first model escalates to second."""
+        graph.reset()
         complete_call_count = 0
 
         async def _complete(msg, *, model, **kw):
@@ -140,6 +146,7 @@ class TestCascade:
                 test_fn=lambda ans: user(ans),
                 test_schema={},
                 models=["cheap", "mid", "expensive"],
+                title="t",
             )
 
         assert model_used == "expensive"
@@ -148,6 +155,7 @@ class TestCascade:
     @pytest.mark.asyncio
     async def test_last_model_accepts_regardless(self):
         """Last model is accepted without testing."""
+        graph.reset()
         extract_mock = AsyncMock(return_value={"sufficient": False})
 
         with patch("motif.flow.llm.complete", new=AsyncMock(return_value="ans")), \
@@ -157,6 +165,7 @@ class TestCascade:
                 test_fn=lambda ans: user(ans),
                 test_schema={},
                 models=["only"],
+                title="t",
             )
 
         assert model_used == "only"
@@ -172,6 +181,7 @@ class TestBlackboard:
     @pytest.mark.asyncio
     async def test_rounds_and_agents(self):
         """N agents × M rounds produces correct history structure."""
+        graph.reset()
         agent_responses = iter(["a1r1", "b1r1", "a1r2", "b1r2"])
 
         async def _complete(msg, **kw):
@@ -185,6 +195,7 @@ class TestBlackboard:
                 ],
                 seed="topic",
                 rounds=2,
+                title="t",
             )
 
         assert len(history) == 2
@@ -195,6 +206,7 @@ class TestBlackboard:
     @pytest.mark.asyncio
     async def test_filter_fn_called(self):
         """filter_fn receives (board, history, name, round)."""
+        graph.reset()
         filter_calls = []
 
         def _filter(board, history, name, rnd):
@@ -207,6 +219,7 @@ class TestBlackboard:
                 seed="topic",
                 rounds=2,
                 filter_fn=_filter,
+                title="t",
             )
 
         # 2 agents × 2 rounds = 4 filter calls
@@ -223,6 +236,7 @@ class TestBlackboard:
     @pytest.mark.asyncio
     async def test_filter_fn_controls_visibility(self):
         """filter_fn can restrict what an agent sees."""
+        graph.reset()
         seen_by_bob = []
 
         async def _complete(msg, **kw):
@@ -246,6 +260,7 @@ class TestBlackboard:
                 seed="topic",
                 rounds=1,
                 filter_fn=_filter,
+                title="t",
             )
 
         # Bob should have seen "FILTERED", not the full board
@@ -260,6 +275,7 @@ class TestCompactEndToEnd:
     @pytest.mark.asyncio
     async def test_under_threshold_noop(self):
         """compact() returns the Msg unchanged when under threshold."""
+        graph.reset()
         msg = system("sys") | user("short")
         result = await flow.compact(msg, max_tokens=100_000)
         assert result is msg  # exact same object
@@ -267,6 +283,7 @@ class TestCompactEndToEnd:
     @pytest.mark.asyncio
     async def test_over_threshold_summarizes(self):
         """compact() calls llm.complete and produces a shorter Msg."""
+        graph.reset()
         # Build a long Msg
         msg = system("sys", cache=True)
         for i in range(30):
@@ -289,6 +306,7 @@ class TestCompactEndToEnd:
     @pytest.mark.asyncio
     async def test_tool_pairs_preserved_after_compact(self):
         """compact() preserves tool_use/tool_result referential integrity."""
+        graph.reset()
         msg = system("sys")
         for i in range(20):
             msg = msg | tool_use(f"c{i}", "fn", {}) | tool_result(f"c{i}", f"r{i}")
@@ -312,6 +330,7 @@ class TestTree:
     @pytest.mark.asyncio
     async def test_leaf_no_split(self):
         """If splitter says is_leaf, analyze directly."""
+        graph.reset()
         with patch("motif.flow.llm.extract", new=AsyncMock(return_value={"is_leaf": True})), \
              patch("motif.flow.llm.complete", new=AsyncMock(return_value="leaf analysis")):
             result = await flow.tree(
@@ -320,12 +339,14 @@ class TestTree:
                 split_schema={},
                 leaf_fn=lambda t: user(t),
                 merge_fn=lambda rs, ls: user(Block.join(rs, labels=ls)),
+                title="t",
             )
         assert result == "leaf analysis"
 
     @pytest.mark.asyncio
     async def test_split_then_merge(self):
         """Splitter returns subtasks → recurse → merge."""
+        graph.reset()
         extract_call_count = 0
 
         async def _extract(msg, schema, **kw):
@@ -359,6 +380,7 @@ class TestTree:
                 split_schema={},
                 leaf_fn=lambda t: user(t),
                 merge_fn=lambda rs, ls: user(Block.join(rs, labels=ls)),
+                title="t",
             )
 
         assert result == "merged result"
@@ -368,6 +390,7 @@ class TestTree:
     @pytest.mark.asyncio
     async def test_max_depth_forces_leaf(self):
         """At max_depth, analyze directly even if content is large."""
+        graph.reset()
         with patch("motif.flow.llm.extract") as mock_extract, \
              patch("motif.flow.llm.complete", new=AsyncMock(return_value="forced leaf")):
             result = await flow.tree(
@@ -377,6 +400,7 @@ class TestTree:
                 leaf_fn=lambda t: user(t),
                 merge_fn=lambda rs, ls: user(Block.join(rs, labels=ls)),
                 max_depth=0,  # force immediate leaf
+                title="t",
             )
 
         assert result == "forced leaf"

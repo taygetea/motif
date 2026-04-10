@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from motif import system, user
-from motif import llm, flow
+from motif import flow
 from motif.tui import FlowApp
 
 ANALYST = system("Analyze through this lens. Be specific. 3-4 sentences.", cache=True)
@@ -39,17 +39,19 @@ async def run_analysis():
     results = await flow.fan(
         LENSES,
         lambda l: ANALYST | user(f"Lens: {l['name']} ({l['focus']})\n\n{DOC}"),
+        title="multi-lens analysis",
         model="claude-sonnet-4-6",
         streaming=True,
-        label="multi-lens analysis",
     )
 
-    synthesis = await llm.complete(
-        system("Synthesize these analyses. What do the lenses reveal together?")
-        | user(flow._join(results, labels=[l["name"] for l in LENSES])),
+    synthesis = await flow.reduce(
+        results,
+        lambda combined: system("Synthesize these analyses. What do the lenses reveal together?")
+        | user(combined),
+        title="synthesis",
+        labels=[l["name"] for l in LENSES],
         model="claude-sonnet-4-6",
         streaming=True,
-        meta={"node": "synthesis"},
     )
 
     return synthesis
@@ -57,8 +59,6 @@ async def run_analysis():
 
 def main():
     app = FlowApp(title="Multi-Lens Analysis")
-    flow.observe(app.flow_observer)
-    llm.observe(app.llm_observer)
     app.run_pipeline(run_analysis)
     app.run()
 
