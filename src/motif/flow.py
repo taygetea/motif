@@ -116,10 +116,20 @@ def _truncate(text: str, length: int = 120) -> str:
     return text[:length - 3] + "..." if len(text) > length else text
 
 
-def _item_label(item: Any, idx: int) -> str:
-    """Extract a display label from a list item."""
+def _item_label(item: Any, idx: int, key: str | None = None) -> str:
+    """Extract a display label from a list item.
+
+    If `key` is given, prefer that field. Otherwise fall back to common
+    label-shaped keys ("name", "label", "title") before defaulting to
+    a positional placeholder.
+    """
     if isinstance(item, dict):
-        return str(item.get("name", item.get("label", f"item_{idx}")))
+        if key is not None and key in item:
+            return str(item[key])[:80]
+        for fallback in ("name", "label", "title"):
+            if fallback in item:
+                return str(item[fallback])[:80]
+        return f"item_{idx}"
     return f"item_{idx}"
 
 
@@ -269,6 +279,58 @@ async def compact(
 
 
 # ---------------------------------------------------------------------------
+# Single call — wrap one llm.complete/extract as a flow node
+# ---------------------------------------------------------------------------
+
+async def call(
+    msg: Msg,
+    *,
+    title: str,
+    model: str = llm.DEFAULT_MODEL,
+    schema: dict | None = None,
+    depth: int = 0,
+    **kw,
+) -> Any:
+    """One LLM call wrapped as a flow node — appears in graph and live display.
+
+    Use this when a bare llm.complete() or llm.extract() call should show up in
+    the trace alongside multi-call patterns. Returns text if no schema, dict if
+    a schema is given.
+
+        report = await flow.call(SYNTHESIZER | user(material), title="synthesis")
+
+        plan = await flow.call(PLANNER | user(topic),
+                               schema=PLAN_SCHEMA, title="planning")
+
+    Without this helper, bare llm calls run successfully but are invisible to
+    flow observers (they only emit llm-level events, not flow events), so they
+    don't appear in the live tree or the saved Trace.
+    """
+    _check_label_kwarg(kw)
+    node, parent = enter_node("call", title, model=model)
+    _emit(FlowEvent("start", title, depth, meta={"model": model}))
+
+    try:
+        if schema is not None:
+            result = await llm.extract(msg, schema=schema, model=model, **kw)
+            preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in result.items())
+            node.output = preview
+        else:
+            result = await llm.complete(msg, model=model, **kw)
+            node.output = result
+            preview = result
+
+        exit_node(node, parent)
+        _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
+                         result=_truncate(preview)))
+        return result
+    except Exception as e:
+        exit_node(node, parent, error=str(e))
+        _emit(FlowEvent("error", title, depth, result=str(e)))
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Branching — one becomes many
 # ---------------------------------------------------------------------------
 
@@ -278,6 +340,7 @@ async def branch(
     *,
     title: str,
     model: str = _CHEAP,
+    label_key: str | None = None,
     depth: int = 0,
     **kw,
 ) -> list[dict]:
@@ -286,10 +349,15 @@ async def branch(
     The schema should produce an object with an array field.
     branch() finds the first list in the result and returns it.
 
+    `label_key` picks which field of each item to use as its display
+    label in the live tree. If omitted, falls back to "name"/"label"/"title"
+    or a positional placeholder.
+
         methods = await branch(
             system("List methodologies...") | user(doc),
             title="discover angles",
             schema=METHODS_SCHEMA,
+            label_key="approach",   # use item["approach"] as the label
         )
     """
     _check_label_kwarg(kw)
@@ -305,12 +373,15 @@ async def branch(
                 items = v
                 break
 
-        child_labels = [_item_label(item, i) for i, item in enumerate(items)]
+        child_labels = [_item_label(item, i, key=label_key) for i, item in enumerate(items)]
         node.output = ", ".join(child_labels)
         exit_node(node, parent)
+        # leaf_children=True tells display observers these "children" are
+        # output values, not subtasks — they shouldn't render as pending.
         _emit(FlowEvent("split", title, depth, children=child_labels,
                          elapsed=node.elapsed,
-                         meta={"count": len(items), "model": model}))
+                         meta={"count": len(items), "model": model,
+                               "leaf_children": True}))
         return items
     except Exception as e:
         exit_node(node, parent, error=str(e))

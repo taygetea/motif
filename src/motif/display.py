@@ -263,9 +263,18 @@ class LiveFlowDisplay:
                 node.children = event.children or []
                 node.elapsed = event.elapsed
                 node.meta.update(event.meta)
+                # Branch splits set leaf_children=True: children are output
+                # values (not subtasks), so they should render as already
+                # settled rather than spinning forever waiting for work that
+                # will never happen. Fan splits leave it false — children are
+                # real subtasks that will get their own start/complete events.
+                leaf = event.meta.get("leaf_children", False)
                 for child in node.children:
                     if child not in self._nodes:
-                        self._nodes[child] = _Node(label=child, depth=event.depth + 1)
+                        child_node = _Node(label=child, depth=event.depth + 1)
+                        if leaf:
+                            child_node.status = "complete"
+                        self._nodes[child] = child_node
 
         elif event.kind in ("complete", "leaf"):
             node = self._nodes.get(label)
