@@ -56,12 +56,54 @@ from motif.llm import CostTracker
 
 
 # --- Configuration ---
+#
+# Roles, not price points. The pipeline names what each call is FOR;
+# a profile (--profile) binds roles to endpoints per deployment.
 
-MODEL = "claude-sonnet-4-6"             # workhorse: research agents, critics, synthesis
-MODEL_BRANCH = "claude-sonnet-4-6"      # decomposition needs to be good
-MODEL_CHEAP = "claude-haiku-4-5"        # reconnaissance sweeps — wide and shallow
+CONTENT = llm.role("content")        # field map, reframe, synthesis
+STRUCTURE = llm.role("structure")    # vocab/premise discovery, decomposition
+SWEEP = llm.role("sweep")            # reconnaissance sweeps — wide and shallow
+SEARCHER = llm.role("searcher")      # research agents and critics (need web access)
+
+_OPENROUTER = "https://openrouter.ai/api/v1"
+
+
+def _deepseek(**extra):
+    return llm.Endpoint(
+        "deepseek/deepseek-v4-flash",
+        base_url=_OPENROUTER,
+        key_env="OPENROUTER_API_KEY",
+        extra={"provider": {"order": ["DeepSeek"], "allow_fallbacks": False},
+               "reasoning": {"enabled": False}, **extra},
+    )
+
+
+# On the OpenAI-compatible transport there is no Anthropic server-side
+# web_search; OpenRouter's web plugin fills the role — results are folded
+# into the prompt before the model runs, so searching calls need no tool
+# loop (each "agent" step is one augmented request).
+_WEB = {"plugins": [{"id": "web", "max_results": 3}]}
+
+PROFILES = {
+    "anthropic": {
+        "content": "claude-sonnet-4-6",
+        "structure": "claude-sonnet-4-6",   # decomposition needs to be good
+        "sweep": "claude-haiku-4-5",
+        "searcher": "claude-sonnet-4-6",
+    },
+    "deepseek": {
+        "content": _deepseek(),
+        "structure": _deepseek(),
+        "sweep": _deepseek(**_WEB),
+        "searcher": _deepseek(**_WEB),
+    },
+}
 
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+
+# Set in main() once --profile is known: the anthropic profile passes the
+# server-side tool schema; other transports carry search on the endpoint.
+SEARCH_TOOL_SCHEMAS: list = [WEB_SEARCH_TOOL]
 
 
 # --- Schemas ---
@@ -305,14 +347,14 @@ async def reconnaissance(topic: str) -> dict:
         flow.branch(
             VOCAB_SCOUT | user(f"Topic: {topic}"),
             schema=VOCABS_SCHEMA,
-            model=MODEL_BRANCH,
+            model=STRUCTURE,
             label_key="community",
             title="vocabulary scout",
         ),
         flow.branch(
             PREMISE_EXTRACTOR | user(f"Question: {topic}"),
             schema=PREMISES_SCHEMA,
-            model=MODEL_BRANCH,
+            model=STRUCTURE,
             label_key="assumption",
             title="premise extractor",
         ),
@@ -327,8 +369,8 @@ async def reconnaissance(topic: str) -> dict:
                 f"Original topic: {topic}"
             ),
             tools={},
-            tool_schemas=[WEB_SEARCH_TOOL],
-            model=MODEL_CHEAP,
+            tool_schemas=SEARCH_TOOL_SCHEMAS,
+            model=SWEEP,
             max_steps=4,
             title=f"sweep: {vocab['community']}",
         )
@@ -364,7 +406,7 @@ async def reframe(topic: str, recon: dict) -> dict:
             labels=["user asked", "vocabularies", "premises", "sweep results"],
         )),
         title="field map",
-        model=MODEL,
+        model=CONTENT,
     )
 
     reframed = await flow.call(
@@ -374,7 +416,7 @@ async def reframe(topic: str, recon: dict) -> dict:
         )),
         schema=REFRAMED_SCHEMA,
         title="reframe",
-        model=MODEL,
+        model=CONTENT,
     )
 
     return {"field_map": field_map, "reframed": reframed}
@@ -389,8 +431,8 @@ async def research_angle(angle: dict) -> str:
             f"Why this matters: {angle['why']}"
         ),
         tools={},
-        tool_schemas=[WEB_SEARCH_TOOL],
-        model=MODEL,
+        tool_schemas=SEARCH_TOOL_SCHEMAS,
+        model=SEARCHER,
         max_steps=8,
         title=angle["name"],
     )
@@ -406,8 +448,8 @@ async def critique_brief(angle: dict, brief: str) -> str:
             "Attack this brief. Use web search to verify load-bearing claims."
         ),
         tools={},
-        tool_schemas=[WEB_SEARCH_TOOL],
-        model=MODEL,
+        tool_schemas=SEARCH_TOOL_SCHEMAS,
+        model=SEARCHER,
         max_steps=5,
         title=f"critique: {angle['name']}",
     )
@@ -499,7 +541,9 @@ def slugify(s: str, maxlen: int = 50) -> str:
 
 def default_output_path(topic: str) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(f"research-{slugify(topic)}-{stamp}.md")
+    out_dir = Path(__file__).parent / "output"
+    out_dir.mkdir(exist_ok=True)
+    return out_dir / f"research-{slugify(topic)}-{stamp}.md"
 
 
 # --- Main ---
@@ -511,7 +555,16 @@ async def main():
                         help="Markdown output file (default: research-<slug>-<timestamp>.md)")
     parser.add_argument("--trace", default=None,
                         help="JSON trace output (default: <output>.trace.json)")
+    parser.add_argument("--profile", default="anthropic", choices=sorted(PROFILES),
+                        help="Which role→endpoint binding to use (default: anthropic)")
     args = parser.parse_args()
+
+    llm.use_profile(PROFILES[args.profile])
+    if args.profile != "anthropic":
+        # Non-anthropic transports carry web search on the endpoint
+        # (OpenRouter web plugin), not as a server-side tool schema.
+        global SEARCH_TOOL_SCHEMAS
+        SEARCH_TOOL_SCHEMAS = []
 
     topic = " ".join(args.topic)
     out_path = Path(args.output) if args.output else default_output_path(topic)
@@ -556,7 +609,7 @@ async def main():
         angles = await flow.branch(
             DECOMPOSER | user(decompose_input),
             schema=ANGLES_SCHEMA,
-            model=MODEL_BRANCH,
+            model=STRUCTURE,
             label_key="name",
             title="decompose",
         )
@@ -589,7 +642,7 @@ async def main():
         report = await flow.call(
             SYNTHESIZER | user(synth_input),
             title="synthesis",
-            model=MODEL,
+            model=CONTENT,
         )
         emit_synthesis(report)
 
