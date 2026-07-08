@@ -86,8 +86,43 @@ class Node:
 # fan node as _current_node. Child enter_node() calls attach to it.
 _current_node: ContextVar[Node | None] = ContextVar('_current_node', default=None)
 
-# Top-level nodes (those with no parent in the graph).
+# Root nodes attach to the active session's list if one is open (see
+# session below), else to this process-global fallback. The fallback
+# keeps zero-ceremony scripts working; anything that runs more than one
+# pipeline in a process (servers, TUIs, tests) should open a session.
 _root_nodes: list[Node] = []
+_session_roots: ContextVar[list[Node] | None] = ContextVar(
+    '_session_roots', default=None)
+
+
+def _active_roots() -> list[Node]:
+    roots = _session_roots.get()
+    return roots if roots is not None else _root_nodes
+
+
+class session:
+    """Isolate a run's graph. Roots created inside attach to this
+    session, not the process-global list — concurrent runs stop
+    interleaving, and long-lived processes stop accumulating.
+
+        with graph.session() as s:
+            await pipeline()
+        report = narrate(s.roots)
+
+    Tasks spawned inside the block inherit the session via contextvar,
+    same as node parenting.
+    """
+
+    def __init__(self):
+        self.roots: list[Node] = []
+        self._token = None
+
+    def __enter__(self) -> "session":
+        self._token = _session_roots.set(self.roots)
+        return self
+
+    def __exit__(self, *args):
+        _session_roots.reset(self._token)
 
 
 def _new_id() -> str:
@@ -121,7 +156,7 @@ def enter_node(kind: str, title: str, **meta) -> tuple[Node, Node | None]:
     if parent:
         parent.children.append(node)
     else:
-        _root_nodes.append(node)
+        _active_roots().append(node)
     _current_node.set(node)
     return node, parent
 
@@ -145,11 +180,13 @@ def current_node() -> Node | None:
 
 
 def root_nodes() -> list[Node]:
-    """Snapshot of top-level nodes."""
-    return list(_root_nodes)
+    """Snapshot of the active scope's top-level nodes (the open session's
+    if inside one, else the process-global fallback)."""
+    return list(_active_roots())
 
 
 def reset():
-    """Clear the graph. For testing and between pipeline runs."""
-    _root_nodes.clear()
+    """Clear the active scope's graph. For testing and between runs in
+    processes that don't use session()."""
+    _active_roots().clear()
     _current_node.set(None)
