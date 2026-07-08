@@ -259,6 +259,19 @@ class TestOpenAIAct:
         assert result.stop_reason == "end_turn"
 
     @pytest.mark.asyncio
+    async def test_empty_tools_omitted_from_body(self):
+        """Some providers 400 on an empty tools array — omit the key."""
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_chat_response("ok"))
+
+        _mock_http(handler)
+        await llm.act(user("q"), [], model=EP)
+        assert "tools" not in seen["body"]
+
+    @pytest.mark.asyncio
     async def test_length_maps_to_max_tokens(self):
         """agent() checks stop_reason == 'max_tokens' — mapping must hold."""
         _mock_http(lambda r: httpx.Response(
@@ -392,3 +405,12 @@ class TestCostTracker:
           {"input_tokens": 500, "output_tokens": 100})
         assert t.input_tokens == 500
         assert t.cost == 0.0
+
+    def test_reported_cost_beats_table(self):
+        """Providers that report billed dollars (OpenRouter) are believed
+        verbatim — even for models in the pricing table."""
+        t = llm.CostTracker()
+        t("complete", None, None, "claude-haiku-4-5",
+          {"input_tokens": 1_000_000, "output_tokens": 0,
+           "reported_cost": 0.05})
+        assert t.cost == pytest.approx(0.05)  # not the table's $0.80

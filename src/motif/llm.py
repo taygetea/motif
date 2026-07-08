@@ -94,6 +94,12 @@ class CostTracker:
         self.cache_creation_tokens += cache_create
         self.calls += 1
 
+        # Providers that report actual billed cost (OpenRouter) beat any
+        # table lookup — use the real number and skip estimation.
+        if "reported_cost" in meta:
+            self._cost += meta["reported_cost"] or 0.0
+            return
+
         # Look up pricing — strip date suffixes for matching
         base_model = model
         for name, prices in _PRICING.items():
@@ -693,8 +699,9 @@ async def act(
     if ep.base_url:
         payload = render(msg, backend="openai")
         body = {"model": ep.model, "max_tokens": max_tokens,
-                "messages": payload["messages"],
-                "tools": _tools_to_openai(tools)}
+                "messages": payload["messages"]}
+        if tools:  # some providers 400 on an empty tools array
+            body["tools"] = _tools_to_openai(tools)
         if temperature is not None:
             body["temperature"] = temperature
         data = await _openai_request(ep, body)
