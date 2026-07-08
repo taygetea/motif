@@ -47,11 +47,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from motif import system, user, Block
-from motif import llm, flow
+from motif import llm, flow, graph
 from motif.display import Trace, LiveFlowDisplay
-from motif.show import (
-    MarkdownRenderer, Section, ContentBlock, Panels, showing,
-)
+from motif.show import narrate
 from motif.llm import CostTracker
 
 
@@ -458,79 +456,6 @@ async def critique_brief(angle: dict, brief: str) -> str:
 
 # --- Markdown emission helpers ---
 
-def emit_recon(topic: str, recon: dict):
-    """Emit reconnaissance phase to the markdown renderer."""
-    flow.show(Section(title="Phase 1 — Reconnaissance", level=2))
-
-    flow.show(Section(title="Vocabularies discovered", level=3))
-    flow.show(Panels(
-        items=[
-            f"**Terms:** {v['terms']}\n\n"
-            f"**Sample query:** `{v['sample_query']}`\n\n"
-            f"**Why this community:** {v['why_this_community']}"
-            for v in recon["vocabs"]
-        ],
-        titles=[v["community"] for v in recon["vocabs"]],
-    ))
-
-    flow.show(Section(title="Premises detected", level=3))
-    flow.show(Panels(
-        items=[
-            f"**If false:** {p['what_breaks_if_false']}"
-            for p in recon["premises"]
-        ],
-        titles=[p["assumption"] for p in recon["premises"]],
-    ))
-
-    flow.show(Section(title="Vocabulary sweeps", level=3))
-    flow.show(Panels(
-        items=recon["sweeps"],
-        titles=[v["community"] for v in recon["vocabs"]],
-    ))
-
-
-def emit_reframe(reframe_result: dict):
-    """Emit reframe phase to the markdown renderer."""
-    flow.show(Section(title="Phase 2 — Reframe", level=2))
-    flow.show(ContentBlock(title="Field map", content=reframe_result["field_map"]))
-
-    r = reframe_result["reframed"]
-    flow.show(ContentBlock(title="Reframed question", content=r["reframed_question"]))
-    flow.show(ContentBlock(
-        title="Mandated angles",
-        content="\n".join(f"- {a}" for a in r["mandated_angles"]),
-    ))
-    flow.show(ContentBlock(
-        title="Scope kept narrow (safety valve)",
-        content="\n".join(f"- {s}" for s in r["scope_kept_narrow"]),
-    ))
-    flow.show(ContentBlock(
-        title="Blind spots folded in",
-        content="\n".join(f"- {b}" for b in r["blind_spots_folded_in"]),
-    ))
-
-
-def emit_research(angles: list[dict], briefs: list[str]):
-    flow.show(Section(title="Phase 3 — Research", level=2))
-    flow.show(Section(title="Angles", level=3))
-    flow.show(Panels(
-        items=[f"**Question:** {a['question']}\n\n**Why:** {a['why']}" for a in angles],
-        titles=[a["name"] for a in angles],
-    ))
-    flow.show(Section(title="Research briefs", level=3))
-    flow.show(Panels(items=briefs, titles=[a["name"] for a in angles]))
-
-
-def emit_critiques(angles: list[dict], critiques: list[str]):
-    flow.show(Section(title="Phase 4 — Adversarial critiques", level=2))
-    flow.show(Panels(items=critiques, titles=[a["name"] for a in angles]))
-
-
-def emit_synthesis(report: str):
-    flow.show(Section(title="Phase 5 — Synthesis", level=2))
-    flow.show(ContentBlock(title="Final report", content=report))
-
-
 # --- File path helpers ---
 
 def slugify(s: str, maxlen: int = 50) -> str:
@@ -573,27 +498,22 @@ async def main():
     trace = Trace()
     display = LiveFlowDisplay()
     cost = CostTracker()
-    renderer = MarkdownRenderer()
 
     flow.observe(trace, display)
     llm.observe(cost)
 
     started = datetime.now()
 
-    async with display, showing(renderer):
-        # Document header
-        flow.show(Section(title=f"Deep research v2", level=1))
-        flow.show(ContentBlock(title="Topic", content=topic))
-        flow.show(ContentBlock(title="Started", content=started.isoformat(timespec="seconds")))
-
+    # The document is narrate(graph) — no hand-written emission. The
+    # session scopes this run's graph; the fold turns it into markdown.
+    with graph.session() as sess:
+      async with display:
         # Phase 1
         recon = await reconnaissance(topic)
-        emit_recon(topic, recon)
 
         # Phase 2
         reframe_result = await reframe(topic, recon)
         reframed = reframe_result["reframed"]
-        emit_reframe(reframe_result)
 
         # Phase 3
         mandated = "\n".join(f"- {a}" for a in reframed["mandated_angles"])
@@ -614,13 +534,11 @@ async def main():
             title="decompose",
         )
         briefs = await asyncio.gather(*[research_angle(a) for a in angles])
-        emit_research(angles, briefs)
 
         # Phase 4
         critiques = await asyncio.gather(*[
             critique_brief(a, b) for a, b in zip(angles, briefs)
         ])
-        emit_critiques(angles, critiques)
 
         # Phase 5
         labels = [a["name"] for a in angles]
@@ -644,30 +562,32 @@ async def main():
             title="synthesis",
             model=CONTENT,
         )
-        emit_synthesis(report)
 
-        # Run summary at the end of the document
-        finished = datetime.now()
-        flow.show(Section(title="Run summary", level=2))
-        flow.show(ContentBlock(
-            title="Stats",
-            content=(
-                f"- Wall time: {trace.total_elapsed:.1f}s\n"
-                f"- LLM calls: {cost.calls}\n"
-                f"- Input tokens: {cost.input_tokens:,}"
-                f" (cache read: {cost.cache_read_tokens:,},"
-                f" cache write: {cost.cache_creation_tokens:,})\n"
-                f"- Output tokens: {cost.output_tokens:,}\n"
-                f"- Estimated cost: ${cost.cost:.4f}\n"
-                f"- Started: {started.isoformat(timespec='seconds')}\n"
-                f"- Finished: {finished.isoformat(timespec='seconds')}"
-            ),
-        ))
+    finished = datetime.now()
 
     flow.clear_observers()
     llm.clear_observers()
 
-    out_path.write_text(renderer.output())
+    stats = (
+        f"- Wall time: {trace.total_elapsed:.1f}s\n"
+        f"- LLM calls: {cost.calls}\n"
+        f"- Input tokens: {cost.input_tokens:,}"
+        f" (cache read: {cost.cache_read_tokens:,},"
+        f" cache write: {cost.cache_creation_tokens:,})\n"
+        f"- Output tokens: {cost.output_tokens:,}\n"
+        f"- Cost: ${cost.cost:.4f}\n"
+        f"- Started: {started.isoformat(timespec='seconds')}\n"
+        f"- Finished: {finished.isoformat(timespec='seconds')}"
+    )
+
+    doc = "\n\n".join([
+        "# Deep research v2",
+        f"**Topic**: {topic}",
+        narrate(sess.roots),
+        "## Run summary",
+        stats,
+    ])
+    out_path.write_text(doc)
     trace.save(str(trace_path))
 
     # Terminal: minimal — the live display already showed structure during the run
