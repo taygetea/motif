@@ -112,3 +112,21 @@ class TestOpenAIEdges:
         assert len(p["messages"]) == 1
         assert p["messages"][0]["content"] == "thinking..."
         assert p["messages"][0]["tool_calls"][0]["function"]["name"] == "fn"
+
+    def test_tool_use_then_text(self):
+        """Assistant text after a tool call fills the None content instead of
+        crashing (regression: += on tool-call-only message's None content)."""
+        msg = tool_use("t1", "search", {"q": "x"}) | assistant("Here's my answer.")
+        p = render(msg, backend="openai")
+        assert len(p["messages"]) == 1
+        m = p["messages"][0]
+        assert m["role"] == "assistant"
+        assert m["tool_calls"][0]["id"] == "t1"
+        assert m["content"] == "Here's my answer."
+
+    def test_tool_use_then_multiple_texts(self):
+        """First text replaces None content, second merges with separator."""
+        msg = tool_use("t1", "fn", {}) | assistant("part one") | assistant("part two")
+        p = render(msg, backend="openai")
+        assert len(p["messages"]) == 1
+        assert p["messages"][0]["content"] == "part one\n\npart two"

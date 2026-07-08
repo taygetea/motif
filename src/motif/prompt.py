@@ -290,7 +290,12 @@ def _render_openai(msg: Msg) -> dict:
 
             case TextSegment(role=role, text=text) if text:
                 if messages and messages[-1]["role"] == role:
-                    messages[-1]["content"] += "\n\n" + text
+                    # Previous message may be a tool-call-only assistant
+                    # message, whose content is None (OpenAI's shape).
+                    prev = messages[-1]["content"]
+                    messages[-1]["content"] = (
+                        text if prev is None else prev + "\n\n" + text
+                    )
                 else:
                     messages.append({"role": role, "content": text})
 
