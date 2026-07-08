@@ -23,6 +23,7 @@ from .prompt import (
     TextSegment, ToolCall, ToolResult,
 )
 from .graph import Node
+from .llm import Endpoint, RoleRef, role, use_profile
 
 __all__ = [
     # Constructors
@@ -35,4 +36,6 @@ __all__ = [
     "Node",
     # Rendering
     "render",
+    # Endpoints and roles
+    "Endpoint", "RoleRef", "role", "use_profile",
 ]
