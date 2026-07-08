@@ -38,10 +38,14 @@ from .graph import enter_node, exit_node, current_node, Node, _new_id
 # Re-export show machinery so users can do flow.show(), flow.showing(), etc.
 from .show import show, show_to, showing, clear_show_observers
 
-# Flow structural decisions (branch, best_of, etc.) use the cheap model.
-# Content generation uses llm.DEFAULT_MODEL. This split is intentional:
-# the topology should be cheap to discover; the work should be high quality.
-_CHEAP = "claude-haiku-4-5"
+# Structural decisions (branching, judging, routing, splitting) default to
+# llm.role("structure"); content generation to llm.role("content"). RoleRefs
+# are lazy — the verbs resolve them at call time against the current profile
+# (llm.use_profile), so which model fills each role is a deployment concern.
+# The role split itself is intentional: topology decisions and content
+# generation are different kinds of work, whatever they happen to cost.
+_STRUCTURE = llm.role("structure")
+_CONTENT = llm.role("content")
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +220,7 @@ async def compact(
     *,
     max_tokens: int = 100_000,
     keep_recent: int = 6,
-    model: str = llm.DEFAULT_MODEL,
+    model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
 ) -> Msg:
     """Compact a Msg if it exceeds the token threshold.
 
@@ -301,7 +305,7 @@ async def call(
     msg: Msg,
     *,
     title: str,
-    model: str = llm.DEFAULT_MODEL,
+    model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     schema: dict | None = None,
     depth: int = 0,
     **kw,
@@ -354,7 +358,7 @@ async def branch(
     schema: dict,
     *,
     title: str,
-    model: str = _CHEAP,
+    model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     label_key: str | None = None,
     depth: int = 0,
     **kw,
@@ -408,7 +412,7 @@ async def fan(
     fn: Callable[[Any], Msg],
     *,
     title: str,
-    model: str = llm.DEFAULT_MODEL,
+    model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     max_concurrency: int | None = None,
     streaming: bool = False,
     depth: int = 0,
@@ -490,7 +494,7 @@ async def reduce(
     *,
     title: str,
     labels: list[str] | None = None,
-    model: str = llm.DEFAULT_MODEL,
+    model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     depth: int = 0,
     **kw,
 ) -> str:
@@ -530,7 +534,7 @@ async def best_of(
     judge_schema: dict,
     *,
     title: str,
-    model: str = _CHEAP,
+    model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     score_key: str = "score",
     depth: int = 0,
 ) -> tuple[str, int, list[dict]]:
@@ -580,7 +584,7 @@ async def cascade(
     models: list[str],
     *,
     title: str,
-    model_test: str = _CHEAP,
+    model_test: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     depth: int = 0,
 ) -> tuple[str, str]:
     """Try cheap models first, escalate until quality passes.
@@ -655,9 +659,9 @@ async def tree(
     title: str,
     paragraph_fn: Callable[[str], list[str]] | None = None,
     max_depth: int = 3,
-    model_split: str = _CHEAP,
-    model_leaf: str = llm.DEFAULT_MODEL,
-    model_merge: str = llm.DEFAULT_MODEL,
+    model_split: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
+    model_leaf: str | llm.Endpoint | llm.RoleRef = _CONTENT,
+    model_merge: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     _depth: int = 0,
 ) -> str:
     """Recursive decomposition. Split until leaves, work leaves, merge up.
@@ -776,7 +780,7 @@ async def tournament(
     judge_schema: dict,
     *,
     title: str,
-    model: str = _CHEAP,
+    model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     winner_key: str = "winner",
     depth: int = 0,
 ) -> tuple[str, int, list]:
@@ -864,7 +868,7 @@ async def blackboard(
     rounds: int = 3,
     *,
     title: str,
-    model: str = llm.DEFAULT_MODEL,
+    model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     filter_fn: Callable[[str, list[dict], str, int], str] | None = None,
     depth: int = 0,
 ) -> tuple[str, list[dict]]:
@@ -978,7 +982,7 @@ async def agent(
     *,
     title: str = "agent",
     signal_tools: dict[str, str] | None = None,
-    model: str = llm.DEFAULT_MODEL,
+    model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     max_steps: int = 20,
     max_tokens: int = 100_000,
     timeout: float | None = None,
