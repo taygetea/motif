@@ -1,16 +1,19 @@
 """Tests for compaction referential integrity — no API calls needed.
 
 The boundary-walking algorithm that preserves tool_use/tool_result
-pairs is pure logic. We test it by building Msgs with known structure
-and verifying the split never breaks a pair.
+pairs is pure logic, exposed as flow._compact_split. We test the real
+function (not a copy) by building Msgs with known structure and
+verifying the split never breaks a pair.
 """
 
 from motif import system, user, assistant, tool_use, tool_result, Msg
+from motif.flow import _compact_split
 from motif.prompt import TextSegment, ToolCall, ToolResult as TR
 
 
 def _split_segments(msg: Msg, keep_recent: int = 6):
-    """Reproduce the compaction split logic from flow.py for testing.
+    """Mirror compact()'s system/rest partition, then apply the real
+    split logic from flow.py.
 
     Returns (system_segs, to_compact, to_keep).
     """
@@ -27,32 +30,7 @@ def _split_segments(msg: Msg, keep_recent: int = 6):
     if len(rest) <= keep_recent:
         return system_segs, [], rest
 
-    split_at = len(rest) - keep_recent
-
-    # Collect tool IDs in tail
-    tail_tool_result_ids = set()
-    tail_tool_use_ids = set()
-    for seg in rest[split_at:]:
-        if isinstance(seg, TR):
-            tail_tool_result_ids.add(seg.tool_use_id)
-        elif isinstance(seg, ToolCall):
-            tail_tool_use_ids.add(seg.id)
-
-    # Walk backward to preserve pairs
-    while split_at > 0:
-        seg = rest[split_at - 1]
-        pull = False
-        if isinstance(seg, ToolCall) and seg.id in tail_tool_result_ids:
-            pull = True
-            tail_tool_use_ids.add(seg.id)
-        elif isinstance(seg, TR) and seg.tool_use_id in tail_tool_use_ids:
-            pull = True
-            tail_tool_result_ids.add(seg.tool_use_id)
-        if pull:
-            split_at -= 1
-        else:
-            break
-
+    split_at = _compact_split(rest, keep_recent)
     return system_segs, rest[:split_at], rest[split_at:]
 
 
@@ -126,6 +104,47 @@ class TestCompactionIntegrity:
         )
         # keep_recent=3 puts c3 result + assistant in tail
         sys_segs, compacted, kept = _split_segments(msg, keep_recent=3)
+        _check_integrity(kept)
+        _check_integrity(compacted)
+
+    def test_non_adjacent_pair_not_split(self):
+        """A pair straddling the boundary WITH segments in between is kept
+        whole (regression: the old walk only checked the segment adjacent
+        to the split, so intervening text orphaned the tool_result)."""
+        msg = (
+            system("sys")
+            | user("q")
+            | tool_use("c1", "search", {"q": "x"})
+            | assistant("thinking about the results")   # intervening
+            | assistant("still thinking")                # intervening
+            | tool_result("c1", "found")                 # lands in tail
+            | user("next")
+            | assistant("done")
+        )
+        # keep_recent=3 puts the split between "still thinking" and the
+        # tool_result — c1's tool_use is two segments back from the boundary.
+        sys_segs, compacted, kept = _split_segments(msg, keep_recent=3)
+        _check_integrity(kept)
+        _check_integrity(compacted)
+        kept_tool_ids = {s.id for s in kept if isinstance(s, ToolCall)}
+        assert "c1" in kept_tool_ids
+
+    def test_non_adjacent_pairs_cascade(self):
+        """Pulling one straddler into the tail can expose another straddling
+        pair further back — the walk must iterate to a fixpoint."""
+        msg = (
+            system("sys")
+            | user("q")
+            | tool_use("c1", "a", {})
+            | assistant("pad")
+            | tool_use("c2", "b", {})
+            | assistant("pad2")
+            | tool_result("c1", "r1")    # pulls c1, dragging c2 into tail...
+            | tool_result("c2", "r2")    # ...whose result must then hold too
+            | user("next")
+            | assistant("done")
+        )
+        sys_segs, compacted, kept = _split_segments(msg, keep_recent=4)
         _check_integrity(kept)
         _check_integrity(compacted)
 

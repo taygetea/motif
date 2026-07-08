@@ -173,6 +173,44 @@ Write as a neutral record, not as a participant. This summary will
 replace the conversation history in an ongoing exchange.""", cache=True)
 
 
+def _compact_split(rest: list, keep_recent: int) -> int:
+    """Index splitting rest into (compactable prefix, kept tail) such that
+    no tool_use/tool_result pair straddles the boundary.
+
+    A pair can straddle with unrelated segments in between, so each round
+    scans the entire compactable prefix — not just the segment adjacent to
+    the split — and moves the boundary back to the earliest straddler.
+    Pulling segments into the tail can bring new tool ids with them, so
+    repeat until stable. Terminates: split_at strictly decreases.
+    """
+    split_at = len(rest) - keep_recent
+
+    while split_at > 0:
+        tail_tool_result_ids = set()
+        tail_tool_use_ids = set()
+        for seg in rest[split_at:]:
+            if isinstance(seg, ToolResult):
+                tail_tool_result_ids.add(seg.tool_use_id)
+            elif isinstance(seg, ToolCall):
+                tail_tool_use_ids.add(seg.id)
+
+        straddler = None
+        for i in range(split_at):
+            seg = rest[i]
+            if isinstance(seg, ToolCall) and seg.id in tail_tool_result_ids:
+                straddler = i
+                break
+            if isinstance(seg, ToolResult) and seg.tool_use_id in tail_tool_use_ids:
+                straddler = i
+                break
+
+        if straddler is None:
+            break
+        split_at = straddler
+
+    return max(split_at, 0)
+
+
 async def compact(
     msg: Msg,
     *,
@@ -209,30 +247,7 @@ async def compact(
     if len(rest) <= keep_recent:
         return msg  # not enough to compact
 
-    # Find the split point, then expand to preserve tool_use/tool_result pairs.
-    split_at = len(rest) - keep_recent
-
-    tail_tool_result_ids = set()
-    tail_tool_use_ids = set()
-    for seg in rest[split_at:]:
-        if isinstance(seg, ToolResult):
-            tail_tool_result_ids.add(seg.tool_use_id)
-        elif isinstance(seg, ToolCall):
-            tail_tool_use_ids.add(seg.id)
-
-    while split_at > 0:
-        seg = rest[split_at - 1]
-        pull = False
-        if isinstance(seg, ToolCall) and seg.id in tail_tool_result_ids:
-            pull = True
-            tail_tool_use_ids.add(seg.id)
-        elif isinstance(seg, ToolResult) and seg.tool_use_id in tail_tool_use_ids:
-            pull = True
-            tail_tool_result_ids.add(seg.tool_use_id)
-        if pull:
-            split_at -= 1
-        else:
-            break
+    split_at = _compact_split(rest, keep_recent)
 
     to_compact = rest[:split_at]
     to_keep = rest[split_at:]
