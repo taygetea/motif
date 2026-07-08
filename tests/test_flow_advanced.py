@@ -405,3 +405,144 @@ class TestTree:
 
         assert result == "forced leaf"
         mock_extract.assert_not_called()  # never asked to split
+
+
+# ---------------------------------------------------------------------------
+# Agent: finalize turn and signal-tool error handling
+# ---------------------------------------------------------------------------
+
+class TestAgentFinalize:
+    @pytest.mark.asyncio
+    async def test_max_steps_triggers_finalize(self):
+        """An agent still calling tools at max_steps gets one tools-free
+        closing call; its text becomes the result."""
+        graph.reset()
+
+        async def _act(*args, **kwargs):
+            return ActResult(
+                text=None, stop_reason="tool_use",
+                tool_calls=[ToolRequest(id="t1", name="search",
+                                        input={"q": "x"})])
+
+        async def _complete(msg, **kwargs):
+            return "The final written answer."
+
+        async def search(input):
+            return "some results"
+
+        with patch("motif.flow.llm.act", new=_act), \
+             patch("motif.flow.llm.complete", new=_complete):
+            result = await flow.agent(
+                user("go"), tools={"search": search},
+                tool_schemas=[{"name": "search", "input_schema": {}}],
+                model="t", max_steps=2, max_tokens=0,
+            )
+
+        assert result.output == "The final written answer."
+        assert result.signal == "max_steps"
+        # finalize appears in the graph as a step
+        agent_node = graph.root_nodes()[0]
+        titles = [c.title for c in agent_node.children]
+        assert "finalize" in titles
+
+    @pytest.mark.asyncio
+    async def test_finalize_false_keeps_old_behavior(self):
+        graph.reset()
+
+        async def _act(*args, **kwargs):
+            return ActResult(
+                text="searching...", stop_reason="tool_use",
+                tool_calls=[ToolRequest(id="t1", name="search",
+                                        input={"q": "x"})])
+
+        async def search(input):
+            return "results"
+
+        completed = []
+
+        async def _complete(msg, **kwargs):
+            completed.append(1)
+            return "should not be called"
+
+        with patch("motif.flow.llm.act", new=_act), \
+             patch("motif.flow.llm.complete", new=_complete):
+            result = await flow.agent(
+                user("go"), tools={"search": search},
+                tool_schemas=[{"name": "search", "input_schema": {}}],
+                model="t", max_steps=2, max_tokens=0, finalize=False,
+            )
+
+        assert completed == []
+        assert result.output == "searching..."
+
+    @pytest.mark.asyncio
+    async def test_finalize_error_falls_back_to_last_text(self):
+        graph.reset()
+
+        async def _act(*args, **kwargs):
+            return ActResult(
+                text="progress so far", stop_reason="tool_use",
+                tool_calls=[ToolRequest(id="t1", name="search",
+                                        input={})])
+
+        async def search(input):
+            return "r"
+
+        async def _complete(msg, **kwargs):
+            raise RuntimeError("api down")
+
+        with patch("motif.flow.llm.act", new=_act), \
+             patch("motif.flow.llm.complete", new=_complete):
+            result = await flow.agent(
+                user("go"), tools={"search": search},
+                tool_schemas=[{"name": "search", "input_schema": {}}],
+                model="t", max_steps=1, max_tokens=0,
+            )
+
+        assert result.output == "progress so far"
+        assert result.signal == "max_steps"
+
+
+class TestAgentSignalToolError:
+    @pytest.mark.asyncio
+    async def test_raising_signal_handler_does_not_crash_loop(self):
+        """A failing FINISH handler becomes an is_error tool_result and
+        the loop continues (parity with regular tools) — regression for
+        the unguarded signal path that left nodes stuck in 'running'."""
+        graph.reset()
+        calls = {"n": 0}
+
+        async def _act(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ActResult(
+                    text=None, stop_reason="tool_use",
+                    tool_calls=[ToolRequest(id="s1", name="finish",
+                                            input={"answer": "x"})])
+            return ActResult(text="recovered after signal failure",
+                             stop_reason="end_turn")
+
+        async def finish(input):
+            raise RuntimeError("signal handler exploded")
+
+        with patch("motif.flow.llm.act", new=_act):
+            result = await flow.agent(
+                user("go"), tools={"finish": finish},
+                tool_schemas=[{"name": "finish", "input_schema": {}}],
+                signal_tools={"finish": "FINISH"},
+                model="t", max_steps=3, max_tokens=0,
+            )
+
+        assert result.output == "recovered after signal failure"
+        assert result.signal is None
+        # error tool_result landed in the Msg
+        errors = [s for s in result.msg.segments
+                  if isinstance(s, TR) and s.is_error]
+        assert len(errors) == 1
+        # no node left permanently running
+        def _all_states(n):
+            yield n.state
+            for c in n.children:
+                yield from _all_states(c)
+        for root in graph.root_nodes():
+            assert "running" not in list(_all_states(root))

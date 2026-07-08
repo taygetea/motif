@@ -1021,6 +1021,7 @@ async def agent(
     max_steps: int = 20,
     max_tokens: int = 100_000,
     timeout: float | None = None,
+    finalize: bool = True,
 ) -> AgentResult:
     """Run an agent loop. The Msg grows until the model finishes or
     calls a flow signal tool.
@@ -1030,6 +1031,9 @@ async def agent(
     signal_tools: {name: signal_type} — tools that break the loop
     max_tokens: threshold for automatic compaction (0 to disable)
     timeout: wall-clock seconds limit
+    finalize: when max_steps runs out with the model still calling
+        tools, make one closing call with no tools so the agent's last
+        word is a written answer, not a half-finished search
 
         result = await agent(
             system("You can search and calculate.") | user("What's 2+2?"),
@@ -1115,10 +1119,22 @@ async def agent(
                 # Check if it's a signal tool
                 if call.name in signal_tools:
                     signal = signal_tools[call.name]
-                    if call.name in tools:
-                        output = await tools[call.name](call.input)
-                    else:
-                        output = str(call.input)
+                    try:
+                        if call.name in tools:
+                            output = await tools[call.name](call.input)
+                        else:
+                            output = str(call.input)
+                    except Exception as e:
+                        # A failing signal handler must not crash the loop
+                        # (parity with regular tools): surface an error
+                        # result and let the model decide what's next.
+                        output = f"Error: {e}"
+                        msg = msg | tool_result(call.id, output, is_error=True)
+                        tool_node.output = output
+                        exit_node(tool_node, tool_parent, error=str(e))
+                        _emit(FlowEvent("error", call_label, 2,
+                                         result=str(e), elapsed=tool_node.elapsed))
+                        continue
 
                     tool_node.output = f"SIGNAL:{signal} {output[:200]}"
                     exit_node(tool_node, tool_parent)
@@ -1179,6 +1195,31 @@ async def agent(
                              meta={"tool_calls": len(result.tool_calls)}))
 
         # Max steps reached
+        if finalize and tool_schemas:
+            # The model was still reaching for tools when the budget ran
+            # out. One closing call with no tools turns everything
+            # gathered into an actual answer.
+            fin_node, fin_parent = enter_node("step", "finalize", finalize=True)
+            _emit(FlowEvent("start", "finalize", 1, meta={"finalize": True}))
+            try:
+                final_text = await llm.complete(
+                    msg | user(
+                        "Your tool budget is exhausted. Write your complete "
+                        "final answer now, based on everything gathered above."),
+                    model=model)
+                if final_text:
+                    last_text = final_text
+                    msg = msg | assistant(final_text)
+                fin_node.output = final_text or ""
+                exit_node(fin_node, fin_parent)
+                _emit(FlowEvent("complete", "finalize", 1,
+                                 result=_truncate(final_text or ""),
+                                 elapsed=fin_node.elapsed))
+            except Exception as e:
+                # Finalize is best-effort — fall back to last_text.
+                exit_node(fin_node, fin_parent, error=str(e))
+                _emit(FlowEvent("error", "finalize", 1, result=str(e)))
+
         node.output = last_text
         node.meta["signal"] = "max_steps"
         exit_node(node, parent)
