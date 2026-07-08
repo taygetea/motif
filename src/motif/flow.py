@@ -36,7 +36,7 @@ from . import llm
 from .graph import enter_node, exit_node, current_node, Node, _new_id
 
 # Re-export show machinery so users can do flow.show(), flow.showing(), etc.
-from .show import show, show_to, showing, clear_show_observers
+from .show import show, show_to, showing, clear_show_observers, narrate
 
 # Structural decisions (branching, judging, routing, splitting) default to
 # llm.role("structure"); content generation to llm.role("content"). RoleRefs
@@ -153,6 +153,29 @@ def _estimate_tokens(msg: Msg) -> int:
         elif isinstance(seg, ToolResult):
             total += len(seg.content)
     return total // 4
+
+
+def _model_label(model) -> str:
+    """Human/JSON-safe label for a model param: RoleRefs become
+    "role:<name>" (the salience policy reads this), Endpoints their
+    model id, strings themselves."""
+    if isinstance(model, llm.RoleRef):
+        return f"role:{model.name}"
+    if isinstance(model, llm.Endpoint):
+        return model.model
+    return str(model)
+
+
+_SHOW_VALUES = ("shown", "collapsed", "hidden")
+
+
+def _show_meta(show: str | None) -> dict:
+    """Validate an author display override for node meta."""
+    if show is None:
+        return {}
+    if show not in _SHOW_VALUES:
+        raise ValueError(f"show= must be one of {_SHOW_VALUES}, got {show!r}")
+    return {"show": show}
 
 
 def _check_label_kwarg(kw: dict):
@@ -305,6 +328,7 @@ async def call(
     msg: Msg,
     *,
     title: str,
+    show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     schema: dict | None = None,
     depth: int = 0,
@@ -326,7 +350,7 @@ async def call(
     don't appear in the live tree or the saved Trace.
     """
     _check_label_kwarg(kw)
-    node, parent = enter_node("call", title, model=model)
+    node, parent = enter_node("call", title, model=_model_label(model), **_show_meta(show))
     _emit(FlowEvent("start", title, depth, meta={"model": model}))
 
     try:
@@ -358,6 +382,7 @@ async def branch(
     schema: dict,
     *,
     title: str,
+    show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     label_key: str | None = None,
     depth: int = 0,
@@ -380,7 +405,7 @@ async def branch(
         )
     """
     _check_label_kwarg(kw)
-    node, parent = enter_node("branch", title, model=model)
+    node, parent = enter_node("branch", title, model=_model_label(model), **_show_meta(show))
     _emit(FlowEvent("start", title, depth, meta={"model": model}))
 
     try:
@@ -412,6 +437,7 @@ async def fan(
     fn: Callable[[Any], Msg],
     *,
     title: str,
+    show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     max_concurrency: int | None = None,
     streaming: bool = False,
@@ -433,7 +459,8 @@ async def fan(
     """
     _check_label_kwarg(kw)
     child_labels = [_item_label(item, i) for i, item in enumerate(items)]
-    node, parent = enter_node("fan", title, model=model, count=len(items))
+    node, parent = enter_node("fan", title, model=_model_label(model), count=len(items),
+                              **_show_meta(show))
     _emit(FlowEvent("start", title, depth, meta={"count": len(items), "model": model}))
     _emit(FlowEvent("split", title, depth, children=child_labels,
                      meta={"count": len(items), "model": model}))
@@ -443,7 +470,7 @@ async def fan(
         # enter_node BEFORE semaphore so all children appear in the graph
         # immediately — TUI can build layout before work starts.
         name = _item_label(item, idx)
-        child, child_parent = enter_node("call", name, model=model)
+        child, child_parent = enter_node("call", name, model=_model_label(model))
         _emit(FlowEvent("start", name, depth + 1, meta={"model": model}))
 
         if sem:
@@ -493,6 +520,7 @@ async def reduce(
     msg_fn: Callable[[str], Msg],
     *,
     title: str,
+    show: str | None = None,
     labels: list[str] | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     depth: int = 0,
@@ -510,7 +538,8 @@ async def reduce(
         )
     """
     _check_label_kwarg(kw)
-    node, parent = enter_node("reduce", title, model=model, inputs=len(results))
+    node, parent = enter_node("reduce", title, model=_model_label(model),
+                              inputs=len(results), **_show_meta(show))
     _emit(FlowEvent("start", title, depth, meta={"inputs": len(results), "model": model}))
 
     try:
@@ -534,6 +563,7 @@ async def best_of(
     judge_schema: dict,
     *,
     title: str,
+    show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     score_key: str = "score",
     depth: int = 0,
@@ -549,8 +579,8 @@ async def best_of(
             schema=SCORE_SCHEMA,
         )
     """
-    node, parent = enter_node("best_of", title,
-                              model=model, candidates=len(candidates))
+    node, parent = enter_node("best_of", title, model=_model_label(model),
+                              candidates=len(candidates), **_show_meta(show))
     _emit(FlowEvent("start", title, depth,
                      meta={"candidates": len(candidates), "model": model}))
 
@@ -584,6 +614,7 @@ async def cascade(
     models: list[str],
     *,
     title: str,
+    show: str | None = None,
     model_test: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     depth: int = 0,
 ) -> tuple[str, str]:
@@ -599,7 +630,7 @@ async def cascade(
             models=["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
         )
     """
-    node, parent = enter_node("cascade", title, models=models)
+    node, parent = enter_node("cascade", title, models=models, **_show_meta(show))
     _emit(FlowEvent("start", title, depth, meta={"models": models}))
     used_model = models[-1]  # fallback
     result = ""
@@ -657,6 +688,7 @@ async def tree(
     merge_fn: Callable[[list[str], list[str]], Msg],
     *,
     title: str,
+    show: str | None = None,
     paragraph_fn: Callable[[str], list[str]] | None = None,
     max_depth: int = 3,
     model_split: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
@@ -690,7 +722,7 @@ async def tree(
             title="decompose document",
         )
     """
-    node, parent = enter_node("tree", title, chars=len(task))
+    node, parent = enter_node("tree", title, chars=len(task), **_show_meta(show))
     _emit(FlowEvent("start", title, _depth, meta={"chars": len(task)}))
 
     try:
@@ -780,6 +812,7 @@ async def tournament(
     judge_schema: dict,
     *,
     title: str,
+    show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
     winner_key: str = "winner",
     depth: int = 0,
@@ -801,8 +834,8 @@ async def tournament(
     if len(candidates) == 1:
         return candidates[0], 0, []
 
-    node, parent = enter_node("tournament", title,
-                              model=model, candidates=len(candidates))
+    node, parent = enter_node("tournament", title, model=_model_label(model),
+                              candidates=len(candidates), **_show_meta(show))
     _emit(FlowEvent("start", title, depth,
                      meta={"candidates": len(candidates), "model": model}))
 
@@ -868,6 +901,7 @@ async def blackboard(
     rounds: int = 3,
     *,
     title: str,
+    show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     filter_fn: Callable[[str, list[dict], str, int], str] | None = None,
     depth: int = 0,
@@ -895,8 +929,8 @@ async def blackboard(
     history = []
     agent_names = [name for name, _ in agents]
 
-    node, parent = enter_node("blackboard", title,
-                              agents=agent_names, rounds=rounds, model=model)
+    node, parent = enter_node("blackboard", title, agents=agent_names, rounds=rounds,
+                              model=_model_label(model), **_show_meta(show))
     _emit(FlowEvent("start", title, depth,
                      meta={"agents": agent_names, "rounds": rounds, "model": model}))
 
@@ -981,6 +1015,7 @@ async def agent(
     tool_schemas: list[dict],
     *,
     title: str = "agent",
+    show: str | None = None,
     signal_tools: dict[str, str] | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _CONTENT,
     max_steps: int = 20,
@@ -1004,8 +1039,9 @@ async def agent(
         )
     """
     signal_tools = signal_tools or {}
-    node, parent = enter_node("agent", title, model=model, max_steps=max_steps)
-    _emit(FlowEvent("start", title, 0, meta={"model": model, "max_steps": max_steps}))
+    node, parent = enter_node("agent", title, model=_model_label(model),
+                              max_steps=max_steps, **_show_meta(show))
+    _emit(FlowEvent("start", title, 0, meta={"model": _model_label(model), "max_steps": max_steps}))
     last_text = ""  # tracks the most recent output for timeout/max_steps
 
     try:

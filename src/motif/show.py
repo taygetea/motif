@@ -209,6 +209,165 @@ class showing:
 
 
 # ---------------------------------------------------------------------------
+# narrate — fold the computation graph into a markdown narrative
+# ---------------------------------------------------------------------------
+#
+# The default display: a homomorphism from the graph to a document, the
+# same move render() makes from Msg to API payloads. Salience is decided
+# by what the node IS — its pattern kind, its declared role, its
+# cardinality, whether it errored — with meta["show"] (the show= kwarg
+# on flow patterns) as the author override. Pipelines get a readable
+# document for free; flow.show() components remain the escape hatch for
+# bespoke curation.
+#
+# Default policy:
+#   hidden     compact (invisible by its own contract)
+#   collapsed  branch / best_of / cascade / tournament (topology, not
+#              content — their outputs are already one-line summaries);
+#              calls declared role:structure
+#   shown      fan children, reduce, call, agent finals, blackboard
+#              rounds, tree results
+#   always     errors surface regardless of policy; a fan wider than
+#              fan_limit collapses to a preview list (salience moves
+#              from the nodes to the aggregate)
+
+
+_COLLAPSED_KINDS = {"branch", "best_of", "cascade", "tournament"}
+
+
+def _first_line(text: str, length: int = 160) -> str:
+    if not text:
+        return ""
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line[: length - 1] + "…" if len(line) > length else line
+    return text[: length - 1] + "…" if len(text) > length else text
+
+
+def _node_policy(node) -> str:
+    """shown | collapsed | hidden — meta['show'] wins, then errors,
+    then kind/role defaults."""
+    override = node.meta.get("show")
+    if override:
+        return override
+    if node.error:
+        return "shown"
+    if node.kind == "compact":
+        return "hidden"
+    if node.kind in _COLLAPSED_KINDS:
+        return "collapsed"
+    if node.kind == "call" and str(node.meta.get("model", "")) == "role:structure":
+        return "collapsed"
+    return "shown"
+
+
+def _collapsed_line(node) -> str:
+    preview = _first_line(node.output)
+    line = f"- **{node.title}**"
+    if preview:
+        line += f" — {preview}"
+    if node.error:
+        line += f" — ⚠ error: {_first_line(node.error)}"
+    return line
+
+
+def _agent_steps_log(node) -> str:
+    """One line per agent step: which tools fired."""
+    lines = []
+    for step in node.children:
+        if step.kind != "step":
+            continue
+        tools = [c.title for c in step.children if c.kind == "tool_call"]
+        detail = ", ".join(tools) if tools else _first_line(step.output, 80)
+        lines.append(f"- {step.title}: {detail}" if detail
+                     else f"- {step.title}")
+    return "\n".join(lines)
+
+
+def narrate(nodes, *, level: int = 2, fan_limit: int = 12) -> str:
+    """Fold graph nodes into a markdown narrative.
+
+        with graph.session() as s:
+            await pipeline()
+        doc = narrate(s.roots)
+
+    level is the heading depth for top-level nodes. fan_limit is the
+    cardinality above which a fan's children collapse to a preview list.
+    """
+    parts = [p for n in nodes for p in _narrate_node(n, level, fan_limit)]
+    return "\n\n".join(p for p in parts if p)
+
+
+def _heading(level: int, title: str) -> str:
+    return f"{'#' * min(level, 6)} {title}"
+
+
+def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
+    policy = _node_policy(node)
+
+    if policy == "hidden":
+        if node.error:  # errors surface even from hidden nodes
+            return [f"> ⚠ error in {node.title}: {_first_line(node.error)}"]
+        return []
+
+    if policy == "collapsed":
+        return [_collapsed_line(node)]
+
+    parts: list[str] = []
+    if node.error:
+        parts.append(f"> ⚠ error in {node.title}: {_first_line(node.error)}")
+
+    match node.kind:
+        case "fan":
+            parts.append(_heading(level, node.title))
+            if len(node.children) > fan_limit:
+                parts.append(f"{len(node.children)} calls (collapsed):")
+                parts.append("\n".join(_collapsed_line(c) for c in node.children))
+            else:
+                for child in node.children:
+                    parts.extend(_narrate_node(child, level + 1, fan_limit))
+
+        case "agent":
+            parts.append(_heading(level, node.title))
+            if node.output:
+                parts.append(node.output)
+            steps = _agent_steps_log(node)
+            if steps:
+                parts.append(f"*Activity:*\n{steps}")
+
+        case "blackboard":
+            parts.append(_heading(level, node.title))
+            for rnd in node.children:
+                if rnd.kind == "round":
+                    parts.append(_heading(level + 1, rnd.title))
+                    for turn in rnd.children:
+                        if turn.output:
+                            parts.append(f"**{turn.title}**: {turn.output}")
+                elif rnd.output:
+                    parts.append(f"**{rnd.title}**: {rnd.output}")
+
+        case "tree":
+            parts.append(_heading(level, node.title))
+            if node.output:
+                parts.append(node.output)
+            sub = [_collapsed_line(c) for c in node.children]
+            if sub:
+                parts.append("*Decomposition:*\n" + "\n".join(sub))
+
+        case _:
+            # call, reduce, round, step, and anything future: title as a
+            # section, own output as content, visible children recursed.
+            parts.append(_heading(level, node.title))
+            if node.output:
+                parts.append(node.output)
+            for child in node.children:
+                parts.extend(_narrate_node(child, level + 1, fan_limit))
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # Renderers
 # ---------------------------------------------------------------------------
 
