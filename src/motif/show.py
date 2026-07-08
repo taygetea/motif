@@ -303,6 +303,43 @@ def _heading(level: int, title: str) -> str:
     return f"{'#' * min(level, 6)} {title}"
 
 
+def _demote_headings(text: str, below: int) -> str:
+    """Shift markdown headings in model-generated output so they nest
+    under a section at `below` — an embedded '# Title' inside an h2
+    section becomes '### Title'. Fenced code blocks are left alone."""
+    lines = text.split("\n")
+    in_fence = False
+    top = None
+    for line in lines:
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("#"):
+            depth = len(line) - len(line.lstrip("#"))
+            if line[depth : depth + 1] == " ":
+                top = depth if top is None else min(top, depth)
+    if top is None:
+        return text
+    shift = (below + 1) - top
+    if shift <= 0:
+        return text
+
+    out = []
+    in_fence = False
+    for line in lines:
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+        elif not in_fence and line.startswith("#"):
+            depth = len(line) - len(line.lstrip("#"))
+            if line[depth : depth + 1] == " ":
+                out.append("#" * min(depth + shift, 6) + line[depth:])
+            else:
+                out.append(line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
     policy = _node_policy(node)
 
@@ -331,7 +368,7 @@ def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
         case "agent":
             parts.append(_heading(level, node.title))
             if node.output:
-                parts.append(node.output)
+                parts.append(_demote_headings(node.output, level))
             steps = _agent_steps_log(node)
             if steps:
                 parts.append(f"*Activity:*\n{steps}")
@@ -350,7 +387,7 @@ def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
         case "tree":
             parts.append(_heading(level, node.title))
             if node.output:
-                parts.append(node.output)
+                parts.append(_demote_headings(node.output, level))
             sub = [_collapsed_line(c) for c in node.children]
             if sub:
                 parts.append("*Decomposition:*\n" + "\n".join(sub))
@@ -360,7 +397,7 @@ def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
             # section, own output as content, visible children recursed.
             parts.append(_heading(level, node.title))
             if node.output:
-                parts.append(node.output)
+                parts.append(_demote_headings(node.output, level))
             for child in node.children:
                 parts.extend(_narrate_node(child, level + 1, fan_limit))
 

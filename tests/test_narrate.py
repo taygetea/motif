@@ -179,3 +179,24 @@ class TestNarrate:
             _node("call", "second", output="2"),
         ])
         assert doc.index("first") < doc.index("second")
+
+
+class TestHeadingDemotion:
+    def test_embedded_h1_nests_under_section(self):
+        n = _node("call", "brief", output="# Research Brief\n\n## Core\n\nBody.")
+        doc = narrate([n])  # section at level 2
+        assert "## brief" in doc
+        assert "### Research Brief" in doc
+        assert "#### Core" in doc
+        assert "\n# Research Brief" not in doc
+
+    def test_code_fences_untouched(self):
+        n = _node("call", "code", output="```python\n# not a heading\n```")
+        doc = narrate([n])
+        assert "# not a heading" in doc
+        assert "### not a heading" not in doc
+
+    def test_already_nested_output_unchanged(self):
+        n = _node("call", "ok", output="#### Deep heading\n\ntext")
+        doc = narrate([n])
+        assert "#### Deep heading" in doc
