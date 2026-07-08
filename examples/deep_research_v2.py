@@ -66,9 +66,9 @@ SEARCHER = llm.role("searcher")      # research agents and critics (need web acc
 _OPENROUTER = "https://openrouter.ai/api/v1"
 
 
-def _deepseek(**extra):
+def _deepseek(model: str = "deepseek/deepseek-v4-flash", **extra):
     return llm.Endpoint(
-        "deepseek/deepseek-v4-flash",
+        model,
         base_url=_OPENROUTER,
         key_env="OPENROUTER_API_KEY",
         extra={"provider": {"order": ["DeepSeek"], "allow_fallbacks": False},
@@ -76,11 +76,8 @@ def _deepseek(**extra):
     )
 
 
-# On the OpenAI-compatible transport there is no Anthropic server-side
-# web_search; OpenRouter's web plugin fills the role — results are folded
-# into the prompt before the model runs, so searching calls need no tool
-# loop (each "agent" step is one augmented request).
-_WEB = {"plugins": [{"id": "web", "max_results": 3}]}
+_DS_PRO = "deepseek/deepseek-v4-pro"      # $0.43/$0.87 per M — the quality tier
+_DS_FLASH = "deepseek/deepseek-v4-flash"  # $0.09/$0.18 per M — bottom of the barrel
 
 PROFILES = {
     "anthropic": {
@@ -89,19 +86,30 @@ PROFILES = {
         "sweep": "claude-haiku-4-5",
         "searcher": "claude-sonnet-4-6",
     },
+    # pro where quality compounds (research, critique, synthesis),
+    # flash where it doesn't (topology, wide-shallow sweeps)
     "deepseek": {
-        "content": _deepseek(),
-        "structure": _deepseek(),
-        "sweep": _deepseek(**_WEB),
-        "searcher": _deepseek(**_WEB),
+        "content": _deepseek(_DS_PRO),
+        "structure": _deepseek(_DS_FLASH),
+        "sweep": _deepseek(_DS_FLASH),
+        "searcher": _deepseek(_DS_PRO),
+    },
+    "deepseek-flash": {  # all-flash: the absolute floor
+        "content": _deepseek(_DS_FLASH),
+        "structure": _deepseek(_DS_FLASH),
+        "sweep": _deepseek(_DS_FLASH),
+        "searcher": _deepseek(_DS_FLASH),
     },
 }
 
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 
-# Set in main() once --profile is known: the anthropic profile passes the
-# server-side tool schema; other transports carry search on the endpoint.
+# Set in main() once --profile is known. The anthropic profile uses the
+# server-side web_search tool (no handlers — the API executes it). Other
+# transports get client-side Exa tools (websearch.py), which means REAL
+# iterative agent loops — search, read, refine — on cheap models.
 SEARCH_TOOL_SCHEMAS: list = [WEB_SEARCH_TOOL]
+SEARCH_TOOL_HANDLERS: dict = {}
 
 
 # --- Schemas ---
@@ -366,7 +374,7 @@ async def reconnaissance(topic: str) -> dict:
                 f"Try this query: {vocab['sample_query']}\n\n"
                 f"Original topic: {topic}"
             ),
-            tools={},
+            tools=SEARCH_TOOL_HANDLERS,
             tool_schemas=SEARCH_TOOL_SCHEMAS,
             model=SWEEP,
             max_steps=4,
@@ -428,7 +436,7 @@ async def research_angle(angle: dict) -> str:
             f"Question: {angle['question']}\n"
             f"Why this matters: {angle['why']}"
         ),
-        tools={},
+        tools=SEARCH_TOOL_HANDLERS,
         tool_schemas=SEARCH_TOOL_SCHEMAS,
         model=SEARCHER,
         max_steps=8,
@@ -445,7 +453,7 @@ async def critique_brief(angle: dict, brief: str) -> str:
             f"{brief}\n\n"
             "Attack this brief. Use web search to verify load-bearing claims."
         ),
-        tools={},
+        tools=SEARCH_TOOL_HANDLERS,
         tool_schemas=SEARCH_TOOL_SCHEMAS,
         model=SEARCHER,
         max_steps=5,
@@ -486,10 +494,12 @@ async def main():
 
     llm.use_profile(PROFILES[args.profile])
     if args.profile != "anthropic":
-        # Non-anthropic transports carry web search on the endpoint
-        # (OpenRouter web plugin), not as a server-side tool schema.
-        global SEARCH_TOOL_SCHEMAS
-        SEARCH_TOOL_SCHEMAS = []
+        # No server-side web_search off the Anthropic API — use the
+        # client-side Exa tools instead (needs EXA_API_KEY).
+        from websearch import WEB_TOOLS, WEB_TOOL_SCHEMAS
+        global SEARCH_TOOL_SCHEMAS, SEARCH_TOOL_HANDLERS
+        SEARCH_TOOL_SCHEMAS = WEB_TOOL_SCHEMAS
+        SEARCH_TOOL_HANDLERS = WEB_TOOLS
 
     topic = " ".join(args.topic)
     out_path = Path(args.output) if args.output else default_output_path(topic)
