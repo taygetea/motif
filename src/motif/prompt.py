@@ -75,8 +75,8 @@ class Block(str):
         if other is None or other == "":
             return self
         if isinstance(other, str):
-            if not other:
-                return self
+            if not self:
+                return Block(str(other))
             return Block(str(other) + "\n\n" + str(self))
         return NotImplemented
 

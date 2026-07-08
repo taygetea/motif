@@ -125,6 +125,28 @@ class TestBlockMonoid:
         result = Block(a) + Block(b)
         assert str(result) == f"{a}\n\n{b}"
 
+    # --- Mixed str/Block operands: __radd__ must agree with __add__ ---
+    # Block is one operation implemented as two dunder methods; these
+    # properties pin them to each other. (Regression: __radd__ once
+    # skipped the empty-right-operand check, so "x" + Block("") gave
+    # 'x\n\n' — an identity-law violation the Block+Block strategies
+    # above could never reach.)
+
+    @given(a=block_text, b=block_text)
+    def test_radd_agrees_with_add(self, a, b):
+        """str + Block == Block + Block for the same texts."""
+        assert a + Block(b) == Block(a) + Block(b)
+
+    @given(a=block_text)
+    def test_right_identity_via_radd(self, a):
+        """plain_str + Block("") == plain_str (identity through __radd__)."""
+        assert a + Block("") == Block(a)
+
+    @given(a=block_text)
+    def test_left_identity_via_radd(self, a):
+        """"" + Block(a) == Block(a) (identity through __radd__)."""
+        assert "" + Block(a) == Block(a)
+
 
 # --- Constructors produce valid Msgs ---
 
