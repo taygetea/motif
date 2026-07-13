@@ -68,6 +68,9 @@ A `Msg` is an immutable sequence of typed segments. `|` composes them. The
 type is a monoid — composition is associative, branching is free, and flow
 patterns are just functions over messages. Agents aren't a framework
 concept; they're what happens when tool results feed back into the Msg.
+The immutability is deep where it matters: `tool_use()` copies its input
+dict, so mutating your dict later — or a tool handler that `pop()`s its
+arguments — can never rewrite what a Msg records as having been invoked.
 
 ```python
 from motif import system, user, assistant, tool_use, tool_result
@@ -164,12 +167,19 @@ Flow patterns default to `role("structure")` for structural decisions
 generation. The split is intentional — they are different kinds of work,
 whatever they happen to cost this month.
 
+The profile binding is a ContextVar, not a process global: `use_profile()`
+applies to the current async context and the tasks it spawns, so concurrent
+runs bound to different profiles cannot switch each other's models mid-fan.
+
 Robustness the author never thinks about: `extract()` degrades invisibly
 from `json_schema` → `json_object` + schema-in-prompt → bare prompt on
 endpoints without structured-output support; `act()` maps finish reasons to
 one vocabulary so agent loops run identically on every transport;
 `CostTracker` believes provider-reported billed dollars (OpenRouter) over
-its own pricing table.
+its own pricing table. And silent partial answers don't exist: a response
+that hits `max_tokens` raises `Truncated` (partial text on the exception,
+fix in the message) from `complete()` and `stream()` alike, unless the
+caller passes `allow_truncation=True`.
 
 ### Layer 3: Flow patterns (`flow.py`)
 
@@ -179,7 +189,7 @@ single verb as a graph node.
 
 | Pattern | Does |
 |---------|------|
-| `branch` | One call discovers structure → list of items (`label_key=` derives display labels from the data) |
+| `branch` | One call discovers structure → list of items. The schema declares exactly one top-level array (`items_key=` selects when there are several; `label_key=` derives display labels from the data) |
 | `fan` | Items → parallel calls → results (with concurrency control) |
 | `reduce` | Results → labeled synthesis → one output |
 | `best_of` | Parallel judging → pick the winner |

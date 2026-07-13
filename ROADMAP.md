@@ -66,7 +66,9 @@ The remaining error surface, in rough order of leverage:
   authoring-in-the-graph.
 - **Observer session-scoping.** `llm._observers` / `flow._observers` /
   `show._show_observers` are the last shared globals (graph roots are
-  already session-scoped). This is the Runtime seam the README names.
+  session-scoped; the role profile became a ContextVar in the 2026-07-13
+  fixes — it was a shared global too, which this entry wrongly denied).
+  This is the Runtime seam the README names.
 - **Schema ergonomics.** Hand-written JSON Schema dicts are the largest
   remaining author error surface by volume. Decide: rehearsal-side
   validation (no new API) vs. a schema helper (new surface). Lean
@@ -77,7 +79,15 @@ The remaining error surface, in rough order of leverage:
 - Open findings from the 2026-07-08 review: CostTracker prefix-matching
   false positives (C1); `extract()` truncation legibility (C2); test gaps
   for `best_of`, `tournament`, `flow.call`, `label_key`, show components,
-  TUI internals.
+  TUI internals. (C2 note: `complete()`/`stream()` truncation now raises
+  `Truncated` as of 2026-07-13; `extract()` remains the open half.)
+- Resolved 2026-07-13 (cross-model audit by GPT-5.6 Sol via codex, fixes
+  by Sol + Claude): tool-input mutation could rewrite recorded history
+  (S1); `tree()` accepted invalid paragraph partitions silently (S2);
+  `complete()` swallowed max_tokens truncation (S3); role profiles were a
+  process global (S4); `branch()` guessed the topology from response
+  order (S5). Pattern worth keeping: every fix validates before the money
+  is spent and puts the fix in the error message.
 - TUI reads the salience policy (it currently has its own display logic).
 - **motif-llm 0.2 to PyPI** once the above settles.
 

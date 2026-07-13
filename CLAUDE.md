@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv sync --extra dev --extra display --extra tui   # full dev install
 
-uv run pytest                        # all 155 tests
+uv run pytest                        # all 171 tests
 uv run pytest tests/test_algebra.py  # one file
 uv run pytest tests/test_flow.py::test_branch -xvs
 
@@ -83,7 +83,7 @@ All patterns: build a graph Node (contextvar parenting — nesting is automatic)
 
 ## Testing
 
-155 tests across 8 files. Always run the full suite before committing changes to `prompt.py`, `flow.py`, `llm.py`, `graph.py`, or `show.py`. Known gaps (see ROADMAP): `best_of`, `tournament`, `flow.call`, `label_key`, show components, TUI internals.
+171 tests across 8 files. Always run the full suite before committing changes to `prompt.py`, `flow.py`, `llm.py`, `graph.py`, or `show.py`. Known gaps (see ROADMAP): `best_of`, `tournament`, `flow.call`, `label_key`, show components, TUI internals.
 
 ## Git workflow
 
