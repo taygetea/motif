@@ -313,3 +313,79 @@ class TestAgent:
         error_results = [s for s in result.msg.segments
                         if isinstance(s, TR) and s.is_error]
         assert len(error_results) == 1
+
+
+# --- tree ---
+
+class TestTree:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("subtasks", "problem"), [
+        ([
+            {"label": "a", "start_paragraph": 0, "end_paragraph": 1},
+            {"label": "b", "start_paragraph": 2, "end_paragraph": 4},
+        ], "gap"),
+        ([
+            {"label": "a", "start_paragraph": 0, "end_paragraph": 1},
+            {"label": "b", "start_paragraph": 1, "end_paragraph": 3},
+        ], "trailing gap"),
+        ([
+            {"label": "a", "start_paragraph": 0, "end_paragraph": 3},
+            {"label": "b", "start_paragraph": 2, "end_paragraph": 4},
+        ], "overlap"),
+        ([
+            {"label": "a", "start_paragraph": 0, "end_paragraph": 2},
+            {"label": "b", "start_paragraph": 2, "end_paragraph": 1},
+        ], "non-empty"),
+        ([
+            {"label": "a", "start_paragraph": -1, "end_paragraph": 2},
+            {"label": "b", "start_paragraph": 2, "end_paragraph": 4},
+        ], "outside"),
+        ([
+            {"label": "a", "start_paragraph": 0, "end_paragraph": 2},
+            {"label": "b", "start_paragraph": 2, "end_paragraph": 5},
+        ], "outside"),
+    ])
+    async def test_rejects_invalid_paragraph_partition(self, subtasks, problem):
+        graph.reset()
+        decision = {"is_leaf": False, "subtasks": subtasks}
+        complete = mock_complete()
+
+        with patch("motif.flow.llm.extract", new=mock_extract(decision)), \
+             patch("motif.flow.llm.complete", new=complete), \
+             pytest.raises(ValueError, match=problem) as exc_info:
+            await flow.tree(
+                task="zero\n\none\n\ntwo\n\nthree",
+                split_fn=lambda t: user(t),
+                split_schema={},
+                leaf_fn=lambda t: user(t),
+                merge_fn=lambda rs, ls: user("merge"),
+                title="t",
+            )
+
+        assert "end_paragraph is exclusive" in str(exc_info.value)
+        complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tells_splitter_ranges_are_half_open(self):
+        graph.reset()
+        extract = mock_extract({"is_leaf": True})
+
+        with patch("motif.flow.llm.extract", new=extract), \
+             patch("motif.flow.llm.complete", new=mock_complete("done")):
+            await flow.tree(
+                task="zero\n\none\n\ntwo",
+                split_fn=lambda t: user(t),
+                split_schema={},
+                leaf_fn=lambda t: user(t),
+                merge_fn=lambda rs, ls: user("merge"),
+                title="t",
+            )
+
+        split_msg = extract.await_args.args[0]
+        prompt = "\n".join(
+            segment.text for segment in split_msg.segments
+            if hasattr(segment, "text")
+        )
+        assert "This text has 3 paragraphs" in prompt
+        assert "start_paragraph is inclusive" in prompt
+        assert "end_paragraph is exclusive" in prompt

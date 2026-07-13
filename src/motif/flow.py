@@ -186,6 +186,58 @@ def _check_label_kwarg(kw: dict):
             "title is now a required keyword argument.")
 
 
+def _check_paragraph_partition(subtasks: list[dict], paragraph_count: int):
+    """Require ordered half-open ranges covering every paragraph once."""
+    expected_start = 0
+    contract = (
+        f"Return contiguous, non-overlapping ranges covering all "
+        f"{paragraph_count} paragraphs: the first start_paragraph must be 0, "
+        "each later start_paragraph must equal the previous end_paragraph, "
+        f"and the final end_paragraph must be {paragraph_count}. "
+        "end_paragraph is exclusive."
+    )
+
+    for i, subtask in enumerate(subtasks):
+        if not isinstance(subtask, dict):
+            raise ValueError(
+                f"Invalid tree partition: subtask {i} must be an object. "
+                f"{contract}")
+        if "start_paragraph" not in subtask or "end_paragraph" not in subtask:
+            raise ValueError(
+                f"Invalid tree partition: subtask {i} must include both "
+                f"start_paragraph and end_paragraph. {contract}")
+
+        start = subtask["start_paragraph"]
+        end = subtask["end_paragraph"]
+        if (not isinstance(start, int) or isinstance(start, bool)
+                or not isinstance(end, int) or isinstance(end, bool)):
+            raise ValueError(
+                f"Invalid tree partition: subtask {i} has range "
+                f"[{start!r}, {end!r}); both bounds must be integers. "
+                f"{contract}")
+        if (start < 0 or start > paragraph_count
+                or end < 0 or end > paragraph_count):
+            raise ValueError(
+                f"Invalid tree partition: subtask {i} range [{start}, {end}) "
+                f"is outside [0, {paragraph_count}). {contract}")
+        if start >= end:
+            raise ValueError(
+                f"Invalid tree partition: subtask {i} range [{start}, {end}) "
+                f"must be non-empty with start_paragraph < end_paragraph. "
+                f"{contract}")
+        if start != expected_start:
+            problem = "gap" if start > expected_start else "overlap or reordering"
+            raise ValueError(
+                f"Invalid tree partition: subtask {i} starts at {start}, "
+                f"expected {expected_start} ({problem}). {contract}")
+        expected_start = end
+
+    if expected_start != paragraph_count:
+        raise ValueError(
+            f"Invalid tree partition: final end_paragraph is {expected_start}, "
+            f"expected {paragraph_count} (trailing gap). {contract}")
+
+
 # ---------------------------------------------------------------------------
 # Compaction — keep Msgs within token limits transparently
 # ---------------------------------------------------------------------------
@@ -698,9 +750,12 @@ async def tree(
 ) -> str:
     """Recursive decomposition. Split until leaves, work leaves, merge up.
 
-    The splitter returns paragraph ranges, not reproduced text. The
-    original text is sliced by the framework — no JSON reproduction of
-    large documents.
+    The splitter returns an ordered partition of paragraph ranges, not
+    reproduced text. Ranges are zero-based and half-open: start_paragraph
+    is inclusive and end_paragraph is exclusive. They must be non-empty,
+    contiguous, non-overlapping, and cover every paragraph exactly once.
+    The original text is sliced by the framework — no JSON reproduction
+    of large documents.
 
     paragraph_fn splits text into indexable chunks. Defaults to
     \\n\\n splitting. Override for texts where \\n\\n doesn't align
@@ -735,9 +790,23 @@ async def tree(
                              result=_truncate(result), elapsed=node.elapsed))
             return result
 
-        # Ask whether to split
-        decision = await llm.extract(split_fn(task), schema=split_schema,
-                                     model=model_split)
+        # Give the range-producing model the exact partition contract.
+        _split = paragraph_fn or (lambda t: t.split("\n\n"))
+        paragraphs = _split(task)
+        partition_instruction = system(
+            f"This text has {len(paragraphs)} paragraphs. If is_leaf is false, "
+            "subtasks must partition all of them in their original order using "
+            "zero-based half-open ranges [start_paragraph, end_paragraph): "
+            "start_paragraph is inclusive and end_paragraph is exclusive. "
+            "The first range must start at 0, each range must be non-empty, "
+            "each later range must start at the previous range's end, and the "
+            f"final range must end at {len(paragraphs)}. Do not return copied text."
+        )
+        decision = await llm.extract(
+            split_fn(task) | partition_instruction,
+            schema=split_schema,
+            model=model_split,
+        )
 
         if decision.get("is_leaf", True):
             result = await llm.complete(leaf_fn(task), model=model_leaf)
@@ -756,28 +825,17 @@ async def tree(
                              result=_truncate(result), elapsed=node.elapsed))
             return result
 
-        # Slice the original text by paragraph ranges — no text in JSON
-        _split = paragraph_fn or (lambda t: t.split("\n\n"))
-        paragraphs = _split(task)
+        # Validate before slicing: Python accepts negative, reversed, and
+        # overlapping slices, so raw slicing cannot enforce the partition.
+        _check_paragraph_partition(subtasks, len(paragraphs))
         child_labels = []
         child_texts = []
 
         for s in subtasks:
             clabel = s.get("label", s.get("name", f"part_{len(child_labels)}"))
             child_labels.append(clabel)
-
-            if "text" in s:
-                child_texts.append(s["text"])
-            elif "start_paragraph" in s:
-                start = s.get("start_paragraph", 0)
-                end = s.get("end_paragraph", len(paragraphs))
-                child_texts.append("\n\n".join(paragraphs[start:end]))
-            else:
-                n = len(subtasks)
-                chunk = len(paragraphs) // n
-                i = len(child_texts)
-                child_texts.append("\n\n".join(
-                    paragraphs[i * chunk : (i + 1) * chunk if i < n - 1 else len(paragraphs)]))
+            child_texts.append("\n\n".join(
+                paragraphs[s["start_paragraph"]:s["end_paragraph"]]))
 
         _emit(FlowEvent("split", title, _depth, children=child_labels,
                          elapsed=time.monotonic() - node._start_time))
