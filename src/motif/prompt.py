@@ -17,6 +17,7 @@ render() knows what to do with them.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 
@@ -195,8 +196,14 @@ def assistant(text: str) -> Msg:
 
 
 def tool_use(id: str, name: str, input: dict | None = None) -> Msg:
-    """A tool invocation segment (from the assistant)."""
-    return Msg(segments=(ToolCall(id, name, input or {}),))
+    """A tool invocation segment (from the assistant).
+
+    The input dict is deep-copied: a Msg records what was invoked, and
+    later mutation of the caller's dict must not rewrite that history.
+    (ToolCall.input itself stays a plain dict because render() JSON-encodes
+    it — construct segments through here, not ToolCall directly.)
+    """
+    return Msg(segments=(ToolCall(id, name, copy.deepcopy(input) if input else {}),))
 
 
 def tool_result(tool_use_id: str, content: str, *, is_error: bool = False) -> Msg:

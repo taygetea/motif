@@ -23,6 +23,7 @@ and emit FlowEvents to observers for backward compatibility.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -1179,7 +1180,9 @@ async def agent(
                     signal = signal_tools[call.name]
                     try:
                         if call.name in tools:
-                            output = await tools[call.name](call.input)
+                            # Handler gets its own copy — a mutating handler
+                            # (input.pop(...)) must not rewrite the recorded call.
+                            output = await tools[call.name](copy.deepcopy(call.input))
                         else:
                             output = str(call.input)
                     except Exception as e:
@@ -1229,7 +1232,9 @@ async def agent(
 
                 try:
                     handler = tools[call.name]
-                    output = await handler(call.input)
+                    # Handler gets its own copy — a mutating handler
+                    # (input.pop(...)) must not rewrite the recorded call.
+                    output = await handler(copy.deepcopy(call.input))
                 except Exception as e:
                     output = f"Error: {e}"
                     msg = msg | tool_result(call.id, output, is_error=True)

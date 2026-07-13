@@ -314,6 +314,28 @@ class TestAgent:
                         if isinstance(s, TR) and s.is_error]
         assert len(error_results) == 1
 
+    @pytest.mark.asyncio
+    async def test_mutating_handler_cannot_rewrite_history(self):
+        """A handler doing input.pop() must not change the recorded tool call —
+        the next model turn must see the arguments as originally requested."""
+        from motif.prompt import ToolCall as TC
+        graph.reset()
+
+        async def popping_handler(inp):
+            return f"handled {inp.pop('q')}"
+
+        with patch("motif.flow.llm.act",
+                   new=mock_act_tool_then_done("search", {"q": "x"})):
+            result = await flow.agent(
+                user("find x"),
+                tools={"search": popping_handler},
+                tool_schemas=[],
+                model="t",
+                max_tokens=0,
+            )
+        recorded = [s for s in result.msg.segments if isinstance(s, TC)]
+        assert recorded[0].input == {"q": "x"}
+
 
 # --- tree ---
 

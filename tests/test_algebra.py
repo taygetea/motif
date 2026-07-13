@@ -173,6 +173,15 @@ class TestConstructors:
         assert m.segments[0].name == "search"
         assert m.segments[0].input == {"q": "test"}
 
+    def test_tool_use_insulates_input_from_mutation(self):
+        """A Msg records what was invoked — mutating the source dict later
+        must not rewrite that history (frozen dataclass alone is shallow)."""
+        d = {"q": "original", "opts": {"n": 1}}
+        m = tool_use("id1", "search", d)
+        d["q"] = "mutated"
+        d["opts"]["n"] = 99
+        assert m.segments[0].input == {"q": "original", "opts": {"n": 1}}
+
     def test_tool_result_produces_msg(self):
         m = tool_result("id1", "found it")
         assert isinstance(m.segments[0], ToolResult)
