@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import json
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Callable, Any
 
@@ -247,11 +248,12 @@ def role(name: str) -> RoleRef:
     return RoleRef(name)
 
 
-_profile: dict[str, str | Endpoint] = {}
+_profile: ContextVar[dict[str, str | Endpoint] | None] = ContextVar(
+    "motif_profile", default=None)
 
 
 def use_profile(profile: dict[str, str | Endpoint]):
-    """Bind role names to models/endpoints for this deployment.
+    """Bind role names to models/endpoints for this run.
 
         llm.use_profile({
             "structure": "claude-haiku-4-5",
@@ -263,17 +265,21 @@ def use_profile(profile: dict[str, str | Endpoint]):
 
     Unbound roles fall back: "content" → DEFAULT_MODEL,
     "structure" → DEFAULT_CHEAP_MODEL. Other unbound names raise at call time.
+
+    The binding is a ContextVar, not a process global: it applies to the
+    current async context and any tasks created after the call. Concurrent
+    runs that bind different profiles cannot switch each other's models.
     """
-    _profile.clear()
-    _profile.update(profile)
+    _profile.set(dict(profile))
 
 
 def _endpoint(model: str | Endpoint | RoleRef) -> Endpoint:
     """Resolve role → binding → Endpoint. A bare model string is an
     Anthropic-transport endpoint."""
     if isinstance(model, RoleRef):
-        if model.name in _profile:
-            model = _profile[model.name]
+        bound = _profile.get() or {}
+        if model.name in bound:
+            model = bound[model.name]
         elif model.name == "content":
             model = DEFAULT_MODEL
         elif model.name == "structure":
@@ -376,6 +382,26 @@ def _tools_to_openai(tools: list[dict]) -> list[dict]:
     } for t in tools]
 
 
+class Truncated(RuntimeError):
+    """A completion hit max_tokens and returned only a partial answer.
+
+    Raised by complete() and stream() so truncation cannot masquerade as a
+    successful result. The partial text is available as `.partial`.
+    """
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
+
+
+def _truncated(max_tokens: int, partial: str) -> Truncated:
+    return Truncated(
+        f"Response hit max_tokens={max_tokens} — this is a partial answer, "
+        f"not a complete one. Raise max_tokens, or pass allow_truncation=True "
+        f"to accept partial output (available on the exception as .partial).",
+        partial)
+
+
 async def complete(
     msg: Msg,
     *,
@@ -383,6 +409,7 @@ async def complete(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
     streaming: bool = False,
+    allow_truncation: bool = False,
     meta: dict | None = None,
 ) -> str:
     """Msg in, text out.
@@ -392,6 +419,10 @@ async def complete(
 
     streaming=True emits per-chunk notifications to observers (for live display)
     while still returning the complete text. Same result, richer observation.
+
+    A response cut off by max_tokens raises Truncated (observers are still
+    notified first, so cost is tracked). Pass allow_truncation=True to get
+    the partial text back as an ordinary return instead.
     """
     ep = _endpoint(DEFAULT_MODEL if model is _UNSET else model)
 
@@ -399,7 +430,8 @@ async def complete(
         # Use stream() internally, collect the result
         chunks = []
         async for chunk in stream(msg, model=ep, max_tokens=max_tokens,
-                                   temperature=temperature, meta=meta):
+                                   temperature=temperature,
+                                   allow_truncation=allow_truncation, meta=meta):
             chunks.append(chunk)
         return "".join(chunks)
 
@@ -410,11 +442,14 @@ async def complete(
         if temperature is not None:
             body["temperature"] = temperature
         data = await _openai_request(ep, body)
-        result = data["choices"][0]["message"].get("content") or ""
+        choice = data["choices"][0]
+        result = choice["message"].get("content") or ""
         _notify("complete", msg, result, ep.model, {
             **(meta or {}),
             **_usage_openai(data),
         })
+        if choice.get("finish_reason") == "length" and not allow_truncation:
+            raise _truncated(max_tokens, result)
         return result
 
     client = _get_client()
@@ -442,6 +477,9 @@ async def complete(
         **(meta or {}),
         **_usage(response),
     })
+    if getattr(response, "stop_reason", None) == "max_tokens" \
+            and not allow_truncation:
+        raise _truncated(max_tokens, result)
     return result
 
 
@@ -451,12 +489,16 @@ async def stream(
     model: str | Endpoint | RoleRef = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
+    allow_truncation: bool = False,
     meta: dict | None = None,
 ):
     """Msg in, async iterator of text chunks out.
 
     Same as complete() but yields tokens as they arrive.
     The full text is also notified to observers after the stream ends.
+    A stream cut off by max_tokens raises Truncated after the last chunk
+    (all chunks were already yielded; observers were notified) unless
+    allow_truncation=True.
 
         async for chunk in llm.stream(prompt):
             print(chunk, end="", flush=True)
@@ -476,6 +518,7 @@ async def stream(
             body["temperature"] = temperature
 
         usage_meta = {}
+        finish_reason = None
         async with _get_http().stream(
             "POST", _openai_url(ep), json=body, headers=_openai_headers(ep),
         ) as resp:
@@ -496,6 +539,8 @@ async def stream(
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0]["finish_reason"]
                 text = (choices[0].get("delta") or {}).get("content")
                 if text:
                     full_text.append(text)
@@ -506,6 +551,8 @@ async def stream(
 
         result = "".join(full_text)
         _notify("stream", msg, result, ep.model, {**_meta, **usage_meta})
+        if finish_reason == "length" and not allow_truncation:
+            raise _truncated(max_tokens, result)
         return
 
     client = _get_client()
@@ -532,6 +579,9 @@ async def stream(
 
     result = "".join(full_text)
     _notify("stream", msg, result, ep.model, {**_meta, **_usage(response)})
+    if getattr(response, "stop_reason", None) == "max_tokens" \
+            and not allow_truncation:
+        raise _truncated(max_tokens, result)
 
 
 async def extract(

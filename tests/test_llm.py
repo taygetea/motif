@@ -19,10 +19,10 @@ from motif import system, user
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
     """Isolate profile and transport state per test."""
-    llm._profile.clear()
+    token = llm._profile.set(None)
     llm.clear_observers()
     yield
-    llm._profile.clear()
+    llm._profile.reset(token)
     llm.clear_observers()
     llm._http = None
 
@@ -157,6 +157,51 @@ class TestOpenAIComplete:
         _mock_http(lambda r: httpx.Response(400, json={"error": "bad"}))
         with pytest.raises(httpx.HTTPStatusError):
             await llm.complete(user("q"), model=EP)
+
+    @pytest.mark.asyncio
+    async def test_truncation_raises(self):
+        """finish_reason='length' must not masquerade as a complete answer."""
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response("partial ans", finish="length")))
+        with pytest.raises(llm.Truncated) as exc:
+            await llm.complete(user("q"), model=EP, max_tokens=8)
+        assert exc.value.partial == "partial ans"
+        assert "max_tokens=8" in str(exc.value)
+        assert "allow_truncation" in str(exc.value)  # the fix is in the message
+
+    @pytest.mark.asyncio
+    async def test_truncation_allowed_returns_partial(self):
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response("partial ans", finish="length")))
+        result = await llm.complete(user("q"), model=EP, allow_truncation=True)
+        assert result == "partial ans"
+
+    @pytest.mark.asyncio
+    async def test_truncation_still_notifies_observers(self):
+        """Cost was incurred — observers must see the call before the raise."""
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response("partial", finish="length")))
+        seen = {}
+        llm.observe(lambda verb, msg, res, model, meta: seen.update(meta, verb=verb))
+        with pytest.raises(llm.Truncated):
+            await llm.complete(user("q"), model=EP)
+        assert seen["verb"] == "complete"
+        assert seen["output_tokens"] == 5
+
+
+class TestProfileIsolation:
+    @pytest.mark.asyncio
+    async def test_concurrent_tasks_keep_their_own_profiles(self):
+        """use_profile in one task must not switch another task's models."""
+        import asyncio
+
+        async def run(model_name):
+            use_profile({"content": model_name})
+            await asyncio.sleep(0)  # yield so the tasks interleave
+            return _endpoint(role("content")).model
+
+        a, b = await asyncio.gather(run("model-a"), run("model-b"))
+        assert (a, b) == ("model-a", "model-b")
 
 
 # --- extract() over the openai transport ---
