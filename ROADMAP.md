@@ -131,6 +131,23 @@ The remaining error surface, in rough order of leverage:
   control channel has to be designed for it. Until then,
   cheap-profile economics make "just rerun it" a legitimate recovery
   strategy: iterate on flash/local, promote to opus once.
+- **The loom.** Steering's general form: a tree of alternative
+  continuations — N samples from one prefix, each spawning its own
+  downstream subtree, per-branch profiles (resample this subtree on opus,
+  leave siblings on flash). Its own thing; not scheduled. What IS current
+  is the do-not-preclude list — invariants any change gets held against
+  so the loom stays buildable:
+    1. Verbs stay pure functions over immutable Msgs; recorded history is
+       what actually ran (the 2026-07-13 immutability fix is load-bearing
+       here).
+    2. The observer seam keeps carrying the full (verb, msg, result,
+       model, meta) per call — it is the loom's data source today; a
+       loom recorder is already buildable as an observer with no core
+       changes.
+    3. Never memoize/dedupe calls by content — caching identical calls
+       would silently collapse deliberate resamples into one node.
+    4. The graph stays open to additive edge types (variant_of siblings);
+       call nodes retaining their input Msg is the known additive gap.
 - **Comparison as a first-class workflow.** Sweeps (persona × condition,
   prompt × model), aggregate views over many runs, the lab notebook that
   accretes: apparatus + traces + conclusions.
