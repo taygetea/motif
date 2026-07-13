@@ -187,6 +187,44 @@ def _check_label_kwarg(kw: dict):
             "title is now a required keyword argument.")
 
 
+def _branch_items_key(schema: dict, items_key: str | None) -> str:
+    """Resolve the top-level array property branch() should fan over."""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError(
+            "branch() schema must define top-level properties containing an "
+            "array. Add schema['properties'] = "
+            "{'items': {'type': 'array', 'items': {...}}}.")
+
+    array_keys = [
+        key for key, property_schema in properties.items()
+        if isinstance(property_schema, dict)
+        and property_schema.get("type") == "array"
+    ]
+
+    if items_key is not None:
+        if items_key not in array_keys:
+            raise ValueError(
+                f"branch() items_key={items_key!r} must name a top-level "
+                "array property in the schema. Declare "
+                f"schema['properties'][{items_key!r}] with "
+                "{'type': 'array', 'items': {...}}.")
+        return items_key
+
+    if not array_keys:
+        raise ValueError(
+            "branch() schema has no top-level array property. Add one under "
+            "schema['properties'], for example "
+            "'items': {'type': 'array', 'items': {...}}.")
+    if len(array_keys) > 1:
+        choices = " or ".join(f"items_key={key!r}" for key in array_keys)
+        names = ", ".join(repr(key) for key in array_keys)
+        raise ValueError(
+            f"branch() schema has multiple top-level array properties: "
+            f"{names}. Pass {choices} to choose which one to fan over.")
+    return array_keys[0]
+
+
 def _check_paragraph_partition(subtasks: list[dict], paragraph_count: int):
     """Require ordered half-open ranges covering every paragraph once."""
     expected_start = 0
@@ -437,14 +475,16 @@ async def branch(
     title: str,
     show: str | None = None,
     model: str | llm.Endpoint | llm.RoleRef = _STRUCTURE,
+    items_key: str | None = None,
     label_key: str | None = None,
     depth: int = 0,
     **kw,
 ) -> list[dict]:
     """One call discovers structure. Returns a list of items.
 
-    The schema should produce an object with an array field.
-    branch() finds the first list in the result and returns it.
+    The schema must produce an object with one top-level array field. If it
+    has multiple top-level arrays, `items_key` explicitly selects the one to
+    return.
 
     `label_key` picks which field of each item to use as its display
     label in the live tree. If omitted, falls back to "name"/"label"/"title"
@@ -458,17 +498,21 @@ async def branch(
         )
     """
     _check_label_kwarg(kw)
+    resolved_items_key = _branch_items_key(schema, items_key)
     node, parent = enter_node("branch", title, model=_model_label(model), **_show_meta(show))
     _emit(FlowEvent("start", title, depth, meta={"model": model}))
 
     try:
         result = await llm.extract(msg, schema=schema, model=model, **kw)
 
-        items = [result]
-        for v in result.values():
-            if isinstance(v, list):
-                items = v
-                break
+        if (not isinstance(result, dict)
+                or not isinstance(result.get(resolved_items_key), list)):
+            raise ValueError(
+                f"branch() expected extraction result field "
+                f"{resolved_items_key!r} to be a list because the schema "
+                "declares it as an array. Ensure the structured-output "
+                "response conforms to the schema.")
+        items = result[resolved_items_key]
 
         child_labels = [_item_label(item, i, key=label_key) for i, item in enumerate(items)]
         node.output = ", ".join(child_labels)

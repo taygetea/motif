@@ -104,23 +104,80 @@ class TestFan:
 
 class TestBranch:
     @pytest.mark.asyncio
-    async def test_extracts_first_list(self):
+    async def test_infers_unique_array_from_schema(self):
         graph.reset()
+        schema = {
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": {"type": "object"}}},
+        }
         response = {"items": [{"name": "a"}, {"name": "b"}]}
         with patch("motif.flow.llm.extract", new=mock_extract(response)):
-            items = await flow.branch(user("q"), schema={}, title="t", model="t")
+            items = await flow.branch(user("q"), schema=schema, title="t", model="t")
         assert len(items) == 2
         assert items[0]["name"] == "a"
 
     @pytest.mark.asyncio
-    async def test_single_result_wrapped(self):
-        """If no list in response, wraps the whole dict as [result]."""
+    async def test_items_key_selects_among_multiple_array_properties(self):
         graph.reset()
-        response = {"answer": "42"}
+        schema = {
+            "type": "object",
+            "properties": {
+                "warnings": {"type": "array", "items": {"type": "string"}},
+                "items": {"type": "array", "items": {"type": "object"}},
+            },
+        }
+        response = {
+            "warnings": ["incomplete source"],
+            "items": [{"name": "a"}, {"name": "b"}],
+        }
         with patch("motif.flow.llm.extract", new=mock_extract(response)):
-            items = await flow.branch(user("q"), schema={}, title="t", model="t")
-        assert len(items) == 1
-        assert items[0]["answer"] == "42"
+            items = await flow.branch(
+                user("q"), schema=schema, items_key="items", title="t", model="t"
+            )
+        assert items == response["items"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_array_properties_require_items_key(self):
+        graph.reset()
+        schema = {
+            "type": "object",
+            "properties": {
+                "warnings": {"type": "array"},
+                "items": {"type": "array"},
+            },
+        }
+        extract = mock_extract({})
+        with patch("motif.flow.llm.extract", new=extract):
+            with pytest.raises(
+                ValueError,
+                match="Pass items_key='warnings' or items_key='items'",
+            ):
+                await flow.branch(user("q"), schema=schema, title="t", model="t")
+        extract.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_schema_without_array_is_rejected_before_extraction(self):
+        graph.reset()
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+        }
+        extract = mock_extract({})
+        with patch("motif.flow.llm.extract", new=extract):
+            with pytest.raises(ValueError, match=r"Add one under schema\['properties'\]"):
+                await flow.branch(user("q"), schema=schema, title="t", model="t")
+        extract.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_list_response_is_rejected(self):
+        graph.reset()
+        schema = {
+            "type": "object",
+            "properties": {"items": {"type": "array"}},
+        }
+        with patch("motif.flow.llm.extract", new=mock_extract({"answer": "42"})):
+            with pytest.raises(ValueError, match="expected extraction result field 'items'"):
+                await flow.branch(user("q"), schema=schema, title="t", model="t")
 
 
 # --- reduce ---
