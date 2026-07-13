@@ -123,7 +123,12 @@ The remaining error surface, in rough order of leverage:
 
 - **Steering.** Pause at pattern boundaries; edit a prompt or profile;
   fork-from-node without re-paying for upstream work. Requires run
-  persistence/resume — the deepest layer motif doesn't have. Until then,
+  persistence/resume — the deepest layer motif doesn't have. Design note
+  (2026-07-13): profiles are now context-local, so a steering surface
+  cannot rebind them from outside the run — pause points must apply
+  edits from within the run's context. That is the correct shape anyway
+  (the run stays the sole authority over its own bindings), but the
+  control channel has to be designed for it. Until then,
   cheap-profile economics make "just rerun it" a legitimate recovery
   strategy: iterate on flash/local, promote to opus once.
 - **Comparison as a first-class workflow.** Sweeps (persona × condition,
