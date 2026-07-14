@@ -97,35 +97,41 @@ semantics):
        as unknowns — "fan: 2–8 branches", "agent: ≤20 turns". Cost is
        an interval or `unknown`, never a scalar estimate; an unbounded
        cost-affecting cardinality reports "cost ceiling unknown; add
-       maxItems". Design (argued Claude↔Sol 2026-07-13; both positions
-       recorded because the synthesis is stronger than either):
-       - *Witnesses by default*: plan-mode verbs return concrete
-         pessimizing witnesses (maxItems placeholder items, placeholder
-         text sized to the producer's max_tokens), so branch/fan/
-         reduce/best_of/blackboard/tournament run their EXISTING code
-         over witnesses with no transfer functions, yielding a
-         worst-case skeleton and cost ceiling — the one number needed
-         before approving a run. (Sol refuted verb substitution for
-         the full min/max envelope — patterns do concrete len()/max()
-         — which is correct; the ceiling artifact survives it.)
-       - *Transfer functions only for the semantically-branching three*:
-         cascade (pessimize = all stages), tree (depth × branching
-         recurrence), agent — which additionally needs a declared
-         per-turn tool-call bound; max_steps alone caps nothing
-         (compaction, finalize, tool fan-out escape it).
-       - *Two boundaries, both real*: ownership (patterns are where plan
-         semantics CAN be installed; author host code can't be
-         rewritten) and semantic (transfer handling is NEEDED exactly
-         where control depends on unknown data — a host loop over
-         concrete config rehearses fine; a host comprehension over
-         branch() output is an opaque expansion site).
-       - *Preconditions* (Sol, correct and important): plan runs create
-         PlanNodes only, never enter_node(), and must not emit to
-         module-global observers — cost trackers would bill imaginary
-         calls. Strengthens the observer session-scoping item.
-       - Full min/max envelopes, where wanted, need the richer internal
-         domain (bounded multiplicities, alternatives, explicit
-         Unknown) folded to a dollar interval at display.
+       maxItems". Design (argued to convergence Claude↔Sol 2026-07-13,
+       five rounds, both positions updated — see the labeling invariant
+       at the end, it is the load-bearing part):
+       - *Witness scenarios, honestly labeled*: plan-mode verbs return
+         concrete schema-derived witnesses, so branch/fan/reduce/
+         best_of/blackboard/tournament run their EXISTING code over
+         them, spending nothing. Run host code at BOTH minItems and
+         maxItems witnesses (bi-extremal scenarios; later: enum members,
+         boundary values — same epistemic status). Output is "maximum
+         observed across N named scenarios" — NEVER "ceiling", "bound",
+         or "worst case". Counterexample forbidding the stronger claim:
+         host code `if len(items) >= 5: cheap else: fan(100, expensive)`
+         — the maxItems witness takes the cheap branch while a legal
+         1-item result takes the expensive one. Concretization RESOLVES
+         what honesty must mark OPAQUE; len() erases the dependency.
+         Only locally-proven-monotone fragments may ever contribute to
+         a claimed bound; values escaping such a fragment into host
+         code need abstract provenance or the scenario label.
+       - *Transfer functions for the semantically-branching three*:
+         cascade (all-stages path), tree (depth × branching recurrence),
+         agent — which needs a declared per-turn tool-call bound
+         (max_steps caps nothing: compaction, finalize, tool fan-out
+         escape it), and compaction breaks cost monotonicity outright
+         (past the threshold, a LARGER history is CHEAPER).
+       - *Two boundaries, both real*: ownership (where plan semantics
+         can be installed) and semantic (where they're needed). Caveat:
+         callbacks perforate ownership — fan.fn, judge_fn, filter_fn,
+         tool handlers. Motif owns the invocation site, not the callback
+         semantics: intercept ≠ understand.
+       - *Preconditions*: plan runs create PlanNodes only, never
+         enter_node(), and must not emit to module-global observers —
+         cost trackers would bill imaginary calls. Strengthens observer
+         session-scoping. Also: envelopes need author-facing maxItems —
+         deep_research_v2's schemas currently declare none, so its
+         honest pre-run answer today is "unknown".
   The plan is a distinct representation, not fake execution:
   `Run(plan, execution)` with type-distinct PlanNode/Node joined by
   `realizes=` edges, rendered by one fold over the tagged union.
@@ -229,14 +235,20 @@ semantics):
   likely producers → fork one candidate with identity-addressed
   upstream reuse → replay downstream → compare. A sparse judgment
   becomes an experimental query, not a training signal. Two-sided
-  refinement: once call-lifecycle events retain input Msgs, dataflow IS
-  recoverable post hoc — motif pipelines interpolate upstream outputs
-  into downstream prompts near-verbatim, so producer edges fall out of
-  span-matching over recorded text, upgrading the "possible
-  contributors" cone to an evidence-ranked producer set. (Textual
-  provenance still isn't semantic responsibility — omission and
-  interaction effects stay unattributable — so label it as evidence,
-  not blame.) Before loom replay exists, this is just drill-in
+  refinement (converged 2026-07-13): once call-lifecycle events retain
+  input Msgs, **lexical lineage** is recoverable post hoc — motif
+  pipelines interpolate upstream outputs into downstream prompts
+  near-verbatim (verified across deep_research_v2's whole chain), so
+  producer edges fall out of span-matching, yielding an evidence-ranked
+  "producer evidence" set. Known degradations: short/boilerplate spans
+  (false positives), host transformations (false negatives), compaction
+  summaries (edges survive, span ancestry doesn't), identical resamples
+  (indistinguishable by content — which is precisely why call identity
+  is irreplaceable), and dense fan-in (the synthesis call consumes
+  every brief, so matching adds nothing exactly where credit matters
+  most). Store spans, offsets, uniqueness, ordering. Never call it
+  blame: matching ranks candidates; only counterfactual replay tests
+  responsibility. Before loom replay exists, this is just drill-in
   navigation and should not be built as a separate feature.
 - **Comparison as a first-class workflow.** Sweeps (persona × condition,
   prompt × model), aggregate views over many runs, the lab notebook that
