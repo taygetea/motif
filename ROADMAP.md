@@ -55,27 +55,69 @@ across runs, steering, and salience control at read time.
 
 ## Scale 1 — the library (weeks)
 
-The remaining error surface, in rough order of leverage:
+The remaining error surface, in rough order of leverage (reordered
+2026-07-13 after a Claude/Sol design conversation — call identity moved
+above rehearsal so replay and planning don't harden around weaker
+semantics):
 
-- **Shape rehearsal.** `flow`-level dry-run mode: verbs mocked, graph built,
-  roles validated, schemas checked, per-role call counts → cost estimate.
-  The single feature that most advances both the library (author's
-  compiler) and the instrument (skeleton-first rendering).
-- **`flow.group(title)`.** A grouping node with no LLM call — turns,
-  phases, authoring sections. Small; unlocks scene rendering and
-  authoring-in-the-graph.
+- **Call-lifecycle protocol.** Per-call identity at the verb boundary:
+  `CallStarted(call_id, verb, msg, declared_role, resolved_endpoint,
+  params)` / `CallChunk` / `CallCompleted(result, usage)` / `CallFailed` —
+  pure Layer-2 facts emitted through the observation seam (a new
+  signature; an adapter may preserve the legacy five-tuple, but don't
+  promise compatibility). A graph-side projection folds them into
+  execution nodes: bare verbs get automatic call nodes (fixing the
+  standing principle-6 violation that raw verb loops are invisible to
+  the tree), `llm.stream()`'s direct graph mutation (exception B2) is
+  eliminated rather than grown, and identical concurrent resamples
+  become distinguishable — today `best_of` judgments, tournament
+  matches, and tree's split/leaf/merge calls all share one node id.
+  Migration notes: fan's preallocated children become honest item slots
+  the call records link beneath; `flow.call()` becomes an author
+  annotation around an automatically recorded call, not a second claim
+  that a call occurred.
 - **Observer session-scoping.** `llm._observers` / `flow._observers` /
   `show._show_observers` are the last shared globals (graph roots are
   session-scoped; the role profile became a ContextVar in the 2026-07-13
   fixes — it was a shared global too, which this entry wrongly denied).
   This is the Runtime seam the README names.
+- **Rehearsal, split into three honest artifacts** (was "shape
+  rehearsal" — the single-feature framing hid the hard question of
+  data-dependent topology):
+    1. *Eager preflight validation* in ordinary execution, not a mode:
+       roles bound, schemas well-formed, kwargs rejected, tool schemas
+       matched to handlers — at verb entry, before the request. (The
+       2026-07-13 branch() fix is the pattern.)
+    2. *Scenario dry-run*: no-transport verbs, reports which call sites
+       one control-flow scenario actually reached. Named honestly — a
+       mocked branch() result selects one downstream path; this is not
+       exhaustive validation.
+    3. *Topology envelope*: exact nodes, bounded repetitions (schema
+       minItems/maxItems, max_steps), and opaque expansion sites shown
+       as unknowns — "fan: 2–8 branches", "agent: ≤20 turns". Cost is
+       an interval or `unknown`, never a scalar estimate; an unbounded
+       cost-affecting cardinality reports "cost ceiling unknown; add
+       maxItems".
+  The plan is a distinct representation, not fake execution:
+  `Run(plan, execution)` with type-distinct PlanNode/Node joined by
+  `realizes=` edges, rendered by one fold over the tagged union.
+  Epistemic status ("did this happen") is never encoded as operation
+  kind; no fake completed call nodes, ever — that would collide with
+  both "nothing mocked" and the loom's "recorded history is what ran."
+- **`flow.group(title)`.** A grouping node with no LLM call — turns,
+  phases, authoring sections. Tiny, worth doing early, but not
+  architecturally prior to the above.
 - **Schema ergonomics.** Hand-written JSON Schema dicts are the largest
   remaining author error surface by volume. Decide: rehearsal-side
   validation (no new API) vs. a schema helper (new surface). Lean
   validation-first.
-- **Enforce the nested-Msg convention.** "Don't pass the agent's Msg into
-  nested flow calls" is documentation; conventions fall out of the author's
-  context. Make it structural or checked.
+- **Msg provider-validity checks** (reframed from "enforce the nested-Msg
+  convention"): validate that a Msg is well-formed for the transport —
+  tool_use/tool_result pairs closed, roles renderable — but do NOT brand
+  Msgs with scope ownership or prohibit reuse. Feeding a recorded prefix
+  into alternative continuations is the loom's core operation; a
+  provenance rule would preserve today's convention by precluding
+  tomorrow's central feature.
 - Open findings from the 2026-07-08 review: CostTracker prefix-matching
   false positives (C1); `extract()` truncation legibility (C2); test gaps
   for `best_of`, `tournament`, `flow.call`, `label_key`, show components,
@@ -140,10 +182,13 @@ The remaining error surface, in rough order of leverage:
     1. Verbs stay pure functions over immutable Msgs; recorded history is
        what actually ran (the 2026-07-13 immutability fix is load-bearing
        here).
-    2. The observer seam keeps carrying the full (verb, msg, result,
-       model, meta) per call — it is the loom's data source today; a
-       loom recorder is already buildable as an observer with no core
-       changes.
+    2. The observation seam keeps carrying the full per-call facts.
+       (Corrected 2026-07-13: the current tuple gives node-scoped
+       correlation — _notify runs in-task, so current_node() is
+       reachable — but NOT per-call identity; multi-call pattern nodes
+       like best_of share one node, so identical resamples are
+       indistinguishable. The call-lifecycle protocol in Scale 1 is the
+       fix; a loom recorder becomes fully buildable once it lands.)
     3. Never memoize/dedupe calls by content — caching identical calls
        would silently collapse deliberate resamples into one node.
     4. The graph stays open to additive edge types (variant_of siblings);
