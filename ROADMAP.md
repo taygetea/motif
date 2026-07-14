@@ -97,7 +97,35 @@ semantics):
        as unknowns — "fan: 2–8 branches", "agent: ≤20 turns". Cost is
        an interval or `unknown`, never a scalar estimate; an unbounded
        cost-affecting cardinality reports "cost ceiling unknown; add
-       maxItems".
+       maxItems". Design (argued Claude↔Sol 2026-07-13; both positions
+       recorded because the synthesis is stronger than either):
+       - *Witnesses by default*: plan-mode verbs return concrete
+         pessimizing witnesses (maxItems placeholder items, placeholder
+         text sized to the producer's max_tokens), so branch/fan/
+         reduce/best_of/blackboard/tournament run their EXISTING code
+         over witnesses with no transfer functions, yielding a
+         worst-case skeleton and cost ceiling — the one number needed
+         before approving a run. (Sol refuted verb substitution for
+         the full min/max envelope — patterns do concrete len()/max()
+         — which is correct; the ceiling artifact survives it.)
+       - *Transfer functions only for the semantically-branching three*:
+         cascade (pessimize = all stages), tree (depth × branching
+         recurrence), agent — which additionally needs a declared
+         per-turn tool-call bound; max_steps alone caps nothing
+         (compaction, finalize, tool fan-out escape it).
+       - *Two boundaries, both real*: ownership (patterns are where plan
+         semantics CAN be installed; author host code can't be
+         rewritten) and semantic (transfer handling is NEEDED exactly
+         where control depends on unknown data — a host loop over
+         concrete config rehearses fine; a host comprehension over
+         branch() output is an opaque expansion site).
+       - *Preconditions* (Sol, correct and important): plan runs create
+         PlanNodes only, never enter_node(), and must not emit to
+         module-global observers — cost trackers would bill imaginary
+         calls. Strengthens the observer session-scoping item.
+       - Full min/max envelopes, where wanted, need the richer internal
+         domain (bounded multiplicities, alternatives, explicit
+         Unknown) folded to a dollar interval at display.
   The plan is a distinct representation, not fake execution:
   `Run(plan, execution)` with type-distinct PlanNode/Node joined by
   `realizes=` edges, rendered by one fold over the tagged union.
@@ -193,6 +221,23 @@ semantics):
        would silently collapse deliberate resamples into one node.
     4. The graph stays open to additive edge types (variant_of siblings);
        call nodes retaining their input Msg is the known additive gap.
+- **Counterfactual debugging** (the loom's human-facing verb; replaces
+  both "blame walk" and pipeline-optimization framings, which were
+  considered and rejected 2026-07-13 — human judgment is too sparse to
+  train on, and today's graph records containment, not dataflow). The
+  honest version: mark an output span → see the emitting call plus its
+  likely producers → fork one candidate with identity-addressed
+  upstream reuse → replay downstream → compare. A sparse judgment
+  becomes an experimental query, not a training signal. Two-sided
+  refinement: once call-lifecycle events retain input Msgs, dataflow IS
+  recoverable post hoc — motif pipelines interpolate upstream outputs
+  into downstream prompts near-verbatim, so producer edges fall out of
+  span-matching over recorded text, upgrading the "possible
+  contributors" cone to an evidence-ranked producer set. (Textual
+  provenance still isn't semantic responsibility — omission and
+  interaction effects stay unattributable — so label it as evidence,
+  not blame.) Before loom replay exists, this is just drill-in
+  navigation and should not be built as a separate feature.
 - **Comparison as a first-class workflow.** Sweeps (persona × condition,
   prompt × model), aggregate views over many runs, the lab notebook that
   accretes: apparatus + traces + conclusions.
