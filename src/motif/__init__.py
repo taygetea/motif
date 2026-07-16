@@ -24,8 +24,9 @@ from .prompt import (
 )
 from .graph import Node
 from .llm import (
-    Endpoint, RoleRef, Truncated, role, use_profile,
-    CallStarted, CallChunk, CallCompleted, CallFailed,
+    Endpoint, DelegatedEndpoint, RoleRef, Truncated, DelegationFailed,
+    role, use_profile,
+    CallStarted, CallChunk, CallCompleted, CallFailed, Attachment,
 )
 from . import record as _record  # installs the graph projection (llm._projection)
 from . import flow as _flow  # registers flow/show observer scopes with graph.session
@@ -42,9 +43,9 @@ __all__ = [
     # Rendering
     "render",
     # Endpoints and roles
-    "Endpoint", "RoleRef", "role", "use_profile",
+    "Endpoint", "DelegatedEndpoint", "RoleRef", "role", "use_profile",
     # Call-lifecycle events (llm.observe_calls)
-    "CallStarted", "CallChunk", "CallCompleted", "CallFailed",
+    "CallStarted", "CallChunk", "CallCompleted", "CallFailed", "Attachment",
     # Errors
-    "Truncated",
+    "Truncated", "DelegationFailed",
 ]

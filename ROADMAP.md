@@ -133,9 +133,18 @@ semantics; the top two landed 2026-07-16, see the ledger):
   Epistemic status ("did this happen") is never encoded as operation
   kind; no fake completed call nodes, ever — that would collide with
   both "nothing mocked" and the loom's "recorded history is what ran."
-- **Delegated endpoints** (designed 2026-07-16, Olivia + Claude + Sol —
-  full contract in notes/2026-07-16-delegated-endpoints-sol.md;
-  implement canary-first). CLI harnesses (codex exec; claude -p behind a
+- **Delegated endpoints** (designed AND core landed 2026-07-16, Olivia +
+  Claude + Sol — contract in notes/2026-07-16-delegated-endpoints-sol.md,
+  canary in notes/2026-07-16-canary-results.md). LANDED: DelegatedEndpoint
+  + hermetic codex adapter (delegated.py), requires= preflight on
+  complete/extract, typed Attachments on events and nodes (transcript,
+  flat prompt, attestation — on failures too), schema ladder
+  (strictify → schema-in-prompt), per-endpoint admission control,
+  subscription usage normalization, live-verified with real search.
+  REMAINING: INVESTIGATION_SCHEMA + deterministic evidence-integrity
+  checks + deep_research_v3 (epistemics-orchestration); a hermetic
+  claude -p adapter when wanted; quota-snapshot parsing (not observed
+  in exec JSONL — may live in session files). CLI harnesses (codex exec; claude -p behind a
   hermetic profile) as a third transport: subscription-priced
   intelligence with free built-in web search, versus Exa's per-call
   dollars. The converged shape:

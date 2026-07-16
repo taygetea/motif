@@ -36,11 +36,14 @@ _open: dict[str, Node] = {}
 def _label(declared) -> str:
     """Display label for the declared model: RoleRefs become
     "role:<name>" (the salience policy keys on this), Endpoints their
-    model id, strings themselves."""
+    model id, delegated endpoints their adapter, strings themselves."""
     if isinstance(declared, llm.RoleRef):
         return f"role:{declared.name}"
     if isinstance(declared, llm.Endpoint):
         return declared.model
+    if isinstance(declared, llm.DelegatedEndpoint):
+        base = f"delegated:{declared.adapter}"
+        return f"{base}:{declared.model}" if declared.model else base
     return str(declared)
 
 
@@ -92,6 +95,8 @@ def project(event) -> None:
         node.meta["usage"] = event.usage
         if event.stop_reason is not None:
             node.meta["stop_reason"] = event.stop_reason
+        if event.attachments:
+            node.attachments = event.attachments
         node.elapsed = time.monotonic() - node._start_time
         node.state = "complete"
         node._bump()
@@ -102,6 +107,8 @@ def project(event) -> None:
             return
         if event.usage:
             node.meta["usage"] = event.usage
+        if event.attachments:
+            node.attachments = event.attachments
         node.elapsed = time.monotonic() - node._start_time
         node.state = "error"
         node.error = event.error

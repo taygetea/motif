@@ -64,6 +64,7 @@ class Node:
     meta: dict = field(default_factory=dict)
     error: str | None = None
     msg: Msg | None = None
+    attachments: tuple = ()  # typed Attachments (llm.py) — receipts, not narrative
     _version: int = 0
     _start_time: float = 0.0
 

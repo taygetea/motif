@@ -183,6 +183,35 @@ caller passes `allow_truncation=True` — and from `extract()`
 unconditionally, because a JSON document cut mid-stream is never a valid
 partial.
 
+**Delegated endpoints.** A third transport: an agentic CLI harness
+(`codex exec`, hermetically sandboxed) serving `complete()`/`extract()`
+as single calls — subscription-priced intelligence with free built-in
+web search. The harness's internal tool loop is recorded as one call
+("a very long LLM call with a weird thinking process"); its full
+transcript, the exact flattened prompt it received, and an effect
+attestation ride along as typed attachments on the call record.
+Pipelines never name the harness — profiles do:
+
+```python
+use_profile({"searcher": DelegatedEndpoint.codex(search=True)})
+
+brief = await llm.complete(RESEARCHER | user(question),
+                           model=role("searcher"),
+                           requires={"web_search"})
+```
+
+`requires=` names what the call depends on; resolution to an endpoint
+that can't provide it fails before any money or quota is spent — a
+searcher bound to a plain model never silently answers from priors.
+Plain `Endpoint`s can declare capabilities too (an OpenRouter
+`:online` model honestly claims `web_search`). Delegated endpoints
+refuse `act()` (the harness runs its own tools; host-side tools are
+`flow.agent`'s job) and `stream()`, and take fresh prompts only — a
+history-bearing Msg fails loudly rather than being silently amputated
+by flat rendering. Admission control caps concurrent harness
+processes per endpoint, so a wide fan can't stampede a subscription
+window.
+
 **The call-lifecycle seam.** Every verb invocation emits typed facts:
 `CallStarted(call_id, verb, msg, declared, endpoint, params, meta)` →
 `CallChunk*` → (`CallCompleted` | `CallFailed`). Each call has its own

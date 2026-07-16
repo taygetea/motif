@@ -29,7 +29,8 @@ from dotenv import load_dotenv
 import anthropic
 import httpx  # transitive dependency of the anthropic SDK — no new top-level dep
 
-from .prompt import Msg, render
+from .prompt import Msg, TextSegment, render
+from . import delegated as _delegated
 
 # Load .env from the project root (or any parent). Does nothing if no .env exists.
 load_dotenv()
@@ -77,6 +78,18 @@ class CallChunk:
 
 
 @dataclass(frozen=True, slots=True)
+class Attachment:
+    """A typed artifact of a call beyond its result — a harness
+    transcript, the exact flattened prompt a CLI received, an effect
+    attestation. Forensics read these; the graph keeps them off to the
+    side of the narrative (never rendered by narrate)."""
+    kind: str          # "harness_transcript" | "harness_stderr" | "flat_prompt" | "attestation"
+    media_type: str    # "application/x-ndjson" | "text/plain" | "application/json"
+    data: str
+    meta: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class CallCompleted:
     """The call returned. stop_reason uses the anthropic vocabulary on
     every transport ("length" arrives as "max_tokens"); a completed
@@ -86,16 +99,20 @@ class CallCompleted:
     result: Any          # str | dict | ActResult — what the verb returns
     usage: dict          # token counts; may carry reported_cost
     stop_reason: str | None = None
+    attachments: tuple[Attachment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class CallFailed:
     """The call raised. usage is non-empty when the transport billed
-    before failing (e.g. a truncated extract that cannot parse)."""
+    before failing (e.g. a truncated extract that cannot parse).
+    Attachments matter most here — a failed investigation's transcript
+    is the forensic record."""
     call_id: str
     error: str
     exception: BaseException | None = None
     usage: dict = field(default_factory=dict)
+    attachments: tuple[Attachment, ...] = ()
 
 
 _call_observers: list[Callable] = []
@@ -436,11 +453,71 @@ class Endpoint:
 
     extra is merged into the request body (openai transport only) —
     provider routing, reasoning toggles, whatever the endpoint speaks.
+
+    capabilities declares what a requires= preflight may rely on
+    (e.g. {"web_search"} for an OpenRouter :online model). Plain
+    endpoints default to none — a call that requires research fails
+    loudly instead of silently answering from priors.
     """
     model: str
     base_url: str | None = None
     key_env: str | None = None
     extra: dict = field(default_factory=dict)
+    capabilities: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class DelegatedEndpoint:
+    """A CLI harness serving complete()/extract() as delegated calls —
+    subscription-priced intelligence whose internal agentic loop is
+    recorded as one call ("a very long LLM call with a weird thinking
+    process"). The invocation is hermetic and its effect ceiling is
+    external-read plus content generation; the full contract and the
+    capability canary live in notes/2026-07-16-*.md.
+
+        SEARCHER = DelegatedEndpoint.codex(search=True)
+        use_profile({"searcher": SEARCHER})
+        brief = await llm.complete(msg, model=llm.role("searcher"),
+                                   requires={"web_search"})
+
+    Supports complete() and extract() only: act() wants tool calls
+    back for the host to execute, and a harness runs its own tools
+    instead. stream() is unsupported (the harness answers when done).
+    """
+    adapter: str                                   # "codex"
+    model: str = ""                                # "" = harness default
+    capabilities: frozenset[str] = frozenset()
+    effort: str | None = None                      # harness reasoning effort
+    search: bool = False
+    timeout: float = 600.0
+    max_concurrency: int = 4                       # admission per endpoint
+    extra_args: tuple[str, ...] = ()
+
+    @classmethod
+    def codex(cls, *, model: str = "", search: bool = True,
+              effort: str | None = None, timeout: float = 600.0,
+              max_concurrency: int = 4,
+              extra_args: tuple[str, ...] = ()) -> "DelegatedEndpoint":
+        caps = {"fs_read"}
+        if search:
+            caps |= {"web_search", "web_fetch"}
+        return cls(adapter="codex", model=model,
+                   capabilities=frozenset(caps), effort=effort,
+                   search=search, timeout=timeout,
+                   max_concurrency=max_concurrency, extra_args=extra_args)
+
+
+# Admission control: one semaphore per delegated endpoint value —
+# a fan cannot stampede a subscription window past the endpoint's
+# declared concurrency.
+_delegated_semaphores: dict[DelegatedEndpoint, asyncio.Semaphore] = {}
+
+
+def _admission(ep: DelegatedEndpoint) -> asyncio.Semaphore:
+    sem = _delegated_semaphores.get(ep)
+    if sem is None:
+        sem = _delegated_semaphores[ep] = asyncio.Semaphore(ep.max_concurrency)
+    return sem
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,8 +566,9 @@ def use_profile(profile: dict[str, str | Endpoint]):
     _profile.set(dict(profile))
 
 
-def _endpoint(model: str | Endpoint | RoleRef) -> Endpoint:
-    """Resolve role → binding → Endpoint. A bare model string is an
+def _endpoint(model: str | Endpoint | DelegatedEndpoint | RoleRef
+              ) -> Endpoint | DelegatedEndpoint:
+    """Resolve role → binding → endpoint. A bare model string is an
     Anthropic-transport endpoint."""
     if isinstance(model, RoleRef):
         bound = _profile.get() or {}
@@ -505,9 +583,84 @@ def _endpoint(model: str | Endpoint | RoleRef) -> Endpoint:
                 f"Role {model.name!r} is not bound — call "
                 f"llm.use_profile({{{model.name!r}: ...}}) "
                 f"(only 'content' and 'structure' have defaults)")
-    if isinstance(model, Endpoint):
+    if isinstance(model, (Endpoint, DelegatedEndpoint)):
         return model
     return Endpoint(model=model)
+
+
+def _check_requires(ep: Endpoint | DelegatedEndpoint,
+                    requires: set[str] | None, verb: str):
+    """Preflight: a call that declares what it needs fails before
+    spending when the resolved endpoint cannot provide it — a searcher
+    bound to a plain model must not silently answer from priors."""
+    if not requires:
+        return
+    missing = set(requires) - set(ep.capabilities)
+    if missing:
+        raise ValueError(
+            f"{verb}() requires {sorted(requires)} but the resolved "
+            f"endpoint ({ep.model!r}) only provides "
+            f"{sorted(ep.capabilities) or 'nothing'} — missing "
+            f"{sorted(missing)}. Bind the role to an endpoint that "
+            f"declares these capabilities (e.g. "
+            f"DelegatedEndpoint.codex(search=True) for web_search, or "
+            f"Endpoint(..., capabilities={{'web_search'}}) for a "
+            f"provider with built-in search).")
+
+
+def _flat_prompt(msg: Msg, verb: str) -> str:
+    """Render a Msg for a prompt-in/answer-out harness. Flat rendering
+    DISCARDS assistant/tool segments, so a history-bearing Msg fails
+    loudly instead of being silently amputated."""
+    dropped = sum(1 for seg in msg.segments
+                  if not (isinstance(seg, TextSegment)
+                          and seg.role in ("system", "user")))
+    if dropped:
+        raise ValueError(
+            f"Delegated {verb}() takes a fresh prompt: this Msg carries "
+            f"{dropped} assistant/tool segment(s) that flat rendering "
+            f"would silently drop. Delegated calls are stateless — put "
+            f"everything the harness needs into system/user text, or "
+            f"use an API endpoint for conversation-shaped calls.")
+    payload = render(msg, backend="flat")
+    if payload["system"]:
+        return (f"<instructions>\n{payload['system']}\n</instructions>"
+                f"\n\n{payload['prompt']}")
+    return payload["prompt"]
+
+
+async def _run_delegated(ep: DelegatedEndpoint, prompt: str,
+                         schema: dict | None) -> _delegated.AdapterResult:
+    if ep.adapter != "codex":
+        raise ValueError(
+            f"Unknown delegated adapter {ep.adapter!r} — only 'codex' "
+            f"exists today. Construct via DelegatedEndpoint.codex(...).")
+    async with _admission(ep):
+        return await _delegated.run_codex(
+            prompt, model=ep.model, effort=ep.effort, search=ep.search,
+            schema=schema, timeout=ep.timeout, extra_args=ep.extra_args)
+
+
+def _delegated_attachments(result: _delegated.AdapterResult,
+                           prompt: str) -> tuple[Attachment, ...]:
+    """The receipts: transcript (the interior we chose not to model),
+    the exact flattened prompt (a harness adds its own system context,
+    so Node.msg alone under-describes what the model saw), and the
+    effect attestation."""
+    attachments = [
+        Attachment("harness_transcript", "application/x-ndjson",
+                   result.transcript,
+                   {"byte_length": len(result.transcript)}),
+        Attachment("flat_prompt", "text/plain", prompt),
+        Attachment("attestation", "application/json",
+                   json.dumps({**result.fingerprint,
+                               "effect_ceiling": "external_read+generation",
+                               "canary": "notes/2026-07-16-canary-results.md"})),
+    ]
+    if result.stderr:
+        attachments.append(
+            Attachment("harness_stderr", "text/plain", result.stderr))
+    return tuple(attachments)
 
 
 # --- OpenAI-compatible transport (httpx) ---
@@ -629,14 +782,105 @@ def _extract_truncated(max_tokens: int, partial: str) -> Truncated:
         partial)
 
 
+class DelegationFailed(RuntimeError):
+    """A delegated harness call did not produce an answer. .kind is the
+    normalized failure ("deadline_exceeded", "auth_failed",
+    "quota_exhausted", "rate_limited", "no_answer", "process_failed",
+    "invalid_structured_output"); the full transcript and stderr are on
+    the CallFailed event's attachments."""
+
+    def __init__(self, message: str, kind: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+async def _delegated_complete(ep: DelegatedEndpoint, msg: Msg,
+                              declared: Any, meta: dict | None) -> str:
+    prompt = _flat_prompt(msg, "complete")
+    call_id = _new_call_id()
+    _emit(CallStarted(call_id, "complete", msg, declared, ep,
+                      {"capabilities": sorted(ep.capabilities),
+                       "timeout": ep.timeout},
+                      dict(meta or {})))
+    try:
+        result = await _run_delegated(ep, prompt, schema=None)
+    except BaseException as e:
+        _emit(CallFailed(call_id, _error_text(e), e))
+        raise
+    attachments = _delegated_attachments(result, prompt)
+    if result.failure is not None:
+        exc = DelegationFailed(
+            f"Delegated complete() failed: {result.failure} "
+            f"(exit={result.exit_code}). "
+            f"{result.stderr.splitlines()[-1] if result.stderr.strip() else ''} "
+            f"— transcript and stderr are attached to the CallFailed event.",
+            result.failure)
+        _emit(CallFailed(call_id, str(exc), exc, usage=result.usage,
+                         attachments=attachments))
+        raise exc
+    _emit(CallCompleted(call_id, result.text, result.usage, "end_turn",
+                        attachments=attachments))
+    return result.text
+
+
+async def _delegated_extract(ep: DelegatedEndpoint, msg: Msg, schema: dict,
+                             declared: Any, meta: dict | None) -> dict:
+    prompt = _flat_prompt(msg, "extract")
+    call_id = _new_call_id()
+    _emit(CallStarted(call_id, "extract", msg, declared, ep,
+                      {"schema": copy.deepcopy(schema),
+                       "capabilities": sorted(ep.capabilities),
+                       "timeout": ep.timeout},
+                      dict(meta or {})))
+    try:
+        # Degradation ladder, same spirit as the openai transport's:
+        # strict mode demands additionalProperties:false everywhere, so
+        # rung 1 strictifies; a schema strict mode still rejects falls
+        # to rung 2, schema-in-prompt. Invisible to the caller.
+        result = await _run_delegated(
+            ep, prompt, schema=_delegated.strictify_schema(schema))
+        if result.failure == "schema_rejected":
+            instructed = (f"{prompt}\n\nRespond with only a JSON object "
+                          f"matching this schema:\n{json.dumps(schema)}")
+            result = await _run_delegated(ep, instructed, schema=None)
+    except BaseException as e:
+        _emit(CallFailed(call_id, _error_text(e), e))
+        raise
+    attachments = _delegated_attachments(result, prompt)
+    if result.failure is None:
+        # The harness enforced the schema; motif still validates the
+        # parse — trust, then verify at the boundary.
+        try:
+            data = json.loads(_strip_fences(result.text))
+        except (json.JSONDecodeError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            _emit(CallCompleted(call_id, data, result.usage, "end_turn",
+                                attachments=attachments))
+            return data
+        exc = DelegationFailed(
+            "Delegated extract() returned unparseable structured output "
+            "— the raw answer and transcript are attached to the "
+            "CallFailed event.", "invalid_structured_output")
+    else:
+        exc = DelegationFailed(
+            f"Delegated extract() failed: {result.failure} "
+            f"(exit={result.exit_code}) — transcript and stderr are "
+            f"attached to the CallFailed event.", result.failure)
+    _emit(CallFailed(call_id, str(exc), exc, usage=result.usage,
+                     attachments=attachments))
+    raise exc
+
+
 async def complete(
     msg: Msg,
     *,
-    model: str | Endpoint | RoleRef = _UNSET,
+    model: str | Endpoint | DelegatedEndpoint | RoleRef = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
     streaming: bool = False,
     allow_truncation: bool = False,
+    requires: set[str] | None = None,
     meta: dict | None = None,
 ) -> str:
     """Msg in, text out.
@@ -650,9 +894,16 @@ async def complete(
     A response cut off by max_tokens raises Truncated (observers are still
     notified first, so cost is tracked). Pass allow_truncation=True to get
     the partial text back as an ordinary return instead.
+
+    requires= names capabilities this call depends on ({"web_search"});
+    resolution fails before spending if the endpoint can't provide them.
     """
     declared = DEFAULT_MODEL if model is _UNSET else model
     ep = _endpoint(declared)
+    _check_requires(ep, requires, "complete")
+
+    if isinstance(ep, DelegatedEndpoint):
+        return await _delegated_complete(ep, msg, declared, meta)
 
     if streaming:
         # Delegate to stream(), collect the result. The lifecycle is
@@ -740,6 +991,10 @@ async def stream(
     """
     declared = DEFAULT_MODEL if model is _UNSET else model
     ep = _endpoint(declared)
+    if isinstance(ep, DelegatedEndpoint):
+        raise TypeError(
+            "stream() does not support delegated endpoints — the harness "
+            "answers when its internal loop finishes. Use complete().")
     _meta = dict(meta or {})
     full_text = []
 
@@ -852,19 +1107,28 @@ async def extract(
     msg: Msg,
     schema: dict,
     *,
-    model: str | Endpoint | RoleRef = _UNSET,
+    model: str | Endpoint | DelegatedEndpoint | RoleRef = _UNSET,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float | None = None,
+    requires: set[str] | None = None,
     meta: dict | None = None,
 ) -> dict:
     """Msg in, structured data out.
 
     Anthropic transport: output_config with json_schema (forced tool use
     on older SDK versions). OpenAI-compatible transport: response_format
-    json_schema (supported by OpenRouter, llama.cpp, vLLM).
+    json_schema (supported by OpenRouter, llama.cpp, vLLM). Delegated
+    transport: the harness's --output-schema, validated again on return.
+
+    requires= names capabilities this call depends on ({"web_search"});
+    resolution fails before spending if the endpoint can't provide them.
     """
     declared = DEFAULT_MODEL if model is _UNSET else model
     ep = _endpoint(declared)
+    _check_requires(ep, requires, "extract")
+
+    if isinstance(ep, DelegatedEndpoint):
+        return await _delegated_extract(ep, msg, schema, declared, meta)
 
     call_id = _new_call_id()
     settled = False  # truncation emits its own CallFailed, with usage
@@ -1056,6 +1320,13 @@ async def act(
     """
     declared = DEFAULT_MODEL if model is _UNSET else model
     ep = _endpoint(declared)
+    if isinstance(ep, DelegatedEndpoint):
+        raise TypeError(
+            "act() does not support delegated endpoints — act() returns "
+            "tool calls for the HOST to execute, and a harness runs its "
+            "own tools instead. Use complete()/extract() on the "
+            "delegated endpoint, or flow.agent with an API endpoint for "
+            "host-side tools.")
 
     call_id = _new_call_id()
     billed: dict = {}

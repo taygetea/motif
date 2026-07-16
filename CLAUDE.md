@@ -43,8 +43,18 @@ src/motif/
                  CostTracker. Knows nothing about the graph.
     record.py    The llm↔graph bridge — projects call events into graph
                  nodes (kind "llm_call", node id == call_id, Node.msg
-                 retained, usage in meta). Installed at import through the
-                 llm._projection slot; exactly one projection may exist.
+                 retained, usage in meta, attachments preserved).
+                 Installed at import through the llm._projection slot;
+                 exactly one projection may exist.
+    delegated.py Leaf module (stdlib only, no motif imports) — the codex
+                 CLI adapter behind DelegatedEndpoint. The hermetic
+                 invocation is load-bearing: --ephemeral
+                 --ignore-user-config -s read-only AND -c mcp_servers={}
+                 (without the last, the harness has live remote-write
+                 app connectors — notes/2026-07-16-canary-results.md).
+                 Prompt via stdin ("-"), own process group, deadline
+                 kill; JSONL is adapter protocol, CLI version
+                 fingerprinted on every result.
     flow.py      Layer 3 — 9 patterns + group + call + compaction + agent
                  (finalize, signal tools) + FlowEvents (legacy, slated for
                  retirement).
@@ -74,6 +84,7 @@ Rules of the house:
 - Every verb emits its lifecycle exactly once: CallStarted, chunks, then one of CallCompleted/CallFailed — even on truncation (Completed carries stop_reason, then the verb raises) and stream abandonment (Failed). Preserve that invariant in any transport change; cost visibility depends on it.
 - Observer meta may carry `reported_cost` (OpenRouter actual billing) — CostTracker prefers it over the `_PRICING` table (matching is exact-or-suffix, never bare prefix). Keep `_PRICING` current.
 - Registration is scope-local, emission additive: observers attached inside a graph.session() detach with it; process-global observers see every run. clear_observers() clears only the active scope and can never silence the graph projection.
+- Delegated endpoints serve complete/extract only, one semantic call node per author operation under every profile (recording granularity follows effect radius, not step count). flow.agent NEVER routes to a harness. requires= preflight fails before spending. Never weaken the hermetic argv.
 - Transport tests live at the mocked-HTTP boundary (`httpx.MockTransport`) in `test_llm.py` — test real parsing code, not mocks of our own functions.
 
 ### Layer 3: `flow.py` — patterns
