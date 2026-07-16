@@ -133,6 +133,56 @@ semantics; the top two landed 2026-07-16, see the ledger):
   Epistemic status ("did this happen") is never encoded as operation
   kind; no fake completed call nodes, ever — that would collide with
   both "nothing mocked" and the loom's "recorded history is what ran."
+- **Delegated endpoints** (designed 2026-07-16 evening, Olivia + Claude +
+  Sol — full contract in notes/2026-07-16-delegated-endpoints-sol.md;
+  implement canary-first). CLI harnesses (codex exec; claude -p behind a
+  hermetic profile) as a third transport: subscription-priced
+  intelligence with free built-in web search, versus Exa's per-call
+  dollars. The converged shape:
+    - No new verb, no harness noun in pipeline code: `complete`/
+      `extract` over a `DelegatedEndpoint`, chosen by profile. A new
+      `requires={"web_read"}` preflight makes a capability-less binding
+      fail before spending instead of silently answering unresearched.
+    - `flow.agent` NEVER routes to a harness — it owns handlers,
+      compaction, signals. Substrate-by-profile applies to calls, not
+      to motif's loop.
+    - **One semantic call node per author operation under every
+      profile.** Recording granularity follows effect radius, not step
+      count: a sandbox-attested read-only delegation is "a very long
+      LLM call with a weird thinking process" (Olivia's framing —
+      reasoning-CoT and server-side search already record this way);
+      write-capable delegation must be agent-shaped. The current
+      anthropic-vs-deepseek searcher shape difference is
+      representational debt, not precedent: if topology varies by
+      profile, cross-profile run diffs are garbage.
+    - Contract essentials: effect attestation emitted by the runner
+      (recorder preserves, never trusts flags), statelessness
+      (--ephemeral / --no-session-persistence), fine-grained
+      capabilities (browser_interact is a WRITE), typed Attachments on
+      CallCompleted AND CallFailed (transcript forensics matter most on
+      failures — never overload Node.msg), invocation fingerprint,
+      usage with usage_complete/billing_basis/quota snapshot (zero
+      dollars ≠ zero resource), normalized failure taxonomy. No turn
+      bound — unenforceable; the honest envelope is "interior opaque,
+      wall-time ≤ T".
+    - Breaks-first (Sol, partly empirical on codex 0.144.3): no tool
+      allowlist flag exists, so EXTERNAL_READ is unproven until a
+      capability canary passes (canary BEFORE any motif code); the
+      controller needs writable runtime separate from the model's
+      read-only sandbox; clean mode may disable the search capability
+      the lane exists for; parallel-session quota behavior on one
+      subscription is unmeasured; JSONL is an adapter protocol —
+      pin versions. Subscription-bulk-use policy is deployment
+      configuration, never a motif invariant.
+    - Downstream: deep_research_v3 becomes epistemics-orchestration —
+      decompose → delegated structured investigations (claim/URL/
+      locator/excerpt at research time; transcripts are forensics, not
+      evidence) → deterministic evidence-INTEGRITY checks (code:
+      resolution, identity, excerpt-occurrence — never semantic truth)
+      → targeted repair → delegated critique over claim IDs +
+      verifier statuses → synthesis that cites claim IDs. This is the
+      structural answer to the 2026-07-16 evaluation finding that the
+      critique layer fabricates methodology from priors.
 - **Schema ergonomics.** Hand-written JSON Schema dicts are the largest
   remaining author error surface by volume. Decide: rehearsal-side
   validation (no new API) vs. a schema helper (new surface). Lean
