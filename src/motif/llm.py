@@ -98,6 +98,14 @@ class CallFailed:
 
 _call_observers: list[Callable] = []
 
+# Session scope for observers. When a graph.session() is open, this
+# holds the session's own observer list — attachments made inside the
+# session go here and detach with it. llm.py knows only that a
+# context-local scope may exist; record.py registers this var with
+# graph.session (llm.py itself knows nothing about the graph).
+_session_call_observers: ContextVar[list[Callable] | None] = ContextVar(
+    "motif_session_call_observers", default=None)
+
 # The graph projection slot — set by record.py at import, deliberately
 # not an entry in the observer registry: clear_observers() must not be
 # able to silence the graph, and exactly one projection may exist (a
@@ -109,23 +117,36 @@ def _new_call_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _active_observers() -> list[Callable]:
+    """The list observe()/observe_calls() attach to: the open session's
+    if inside one, else the process globals."""
+    scope = _session_call_observers.get()
+    return scope if scope is not None else _call_observers
+
+
 def _emit(event) -> None:
     if _projection is not None:
         try:
             _projection(event)
         except Exception:
             pass  # the record must not break the pipeline
-    for obs in _call_observers:
-        try:
-            obs(event)
-        except Exception:
-            pass  # observers must not break the pipeline
+    # Emission is additive: process-global observers see every run;
+    # session observers see their own run.
+    scope = _session_call_observers.get()
+    for observers in (_call_observers, scope or ()):
+        for obs in observers:
+            try:
+                obs(event)
+            except Exception:
+                pass  # observers must not break the pipeline
 
 
 def observe_calls(*observers: Callable):
     """Attach observers to the call-lifecycle seam. Each receives
-    CallStarted / CallChunk / CallCompleted / CallFailed events."""
-    _call_observers.extend(observers)
+    CallStarted / CallChunk / CallCompleted / CallFailed events.
+    Inside a graph.session(), the attachment is scoped to the session
+    and detaches with it."""
+    _active_observers().extend(observers)
 
 
 class _LegacyAdapter:
@@ -162,13 +183,14 @@ def observe(*observers: Callable):
     """Attach legacy observer callbacks. Each receives
     (verb, msg, result, model, meta) — derived from the call-lifecycle
     events by an adapter. New code should prefer observe_calls()."""
-    _call_observers.extend(_LegacyAdapter(o) for o in observers)
+    _active_observers().extend(_LegacyAdapter(o) for o in observers)
 
 
 def clear_observers():
-    """Remove all observers (both signatures). The graph projection is
-    not an observer and survives."""
-    _call_observers.clear()
+    """Remove the active scope's observers (both signatures): the open
+    session's if inside one, else the process globals. The graph
+    projection is not an observer and survives."""
+    _active_observers().clear()
 
 
 # Pricing per million tokens (input, output, cache_read, cache_write).

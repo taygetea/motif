@@ -28,6 +28,7 @@ from .llm import (
     CallStarted, CallChunk, CallCompleted, CallFailed,
 )
 from . import record as _record  # installs the graph projection (llm._projection)
+from . import flow as _flow  # registers flow/show observer scopes with graph.session
 
 __all__ = [
     # Constructors

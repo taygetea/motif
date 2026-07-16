@@ -26,7 +26,7 @@ import json
 import time
 
 from . import llm
-from .graph import Node, attach
+from .graph import Node, attach, _register_scoped
 
 # Calls in flight: call_id -> Node. Single-threaded asyncio access;
 # entries are removed when the call settles, so this cannot grow.
@@ -109,5 +109,8 @@ def project(event) -> None:
 
 
 # Install: llm.py exposes a single projection slot instead of importing
-# the graph — the dependency points upward, injected here.
+# the graph — the dependency points upward, injected here. The same
+# inversion wires llm's observer scope into graph.session (flow and
+# show register their own; llm cannot without importing graph).
 llm._projection = project
+_register_scoped(llm._session_call_observers)

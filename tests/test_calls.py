@@ -235,7 +235,7 @@ class TestLegacyAdapter:
             await llm.complete(user("q"), model=EP)
         assert calls == []
         # adapter state cleaned up: no dangling started entries
-        adapter = llm._call_observers[-1]
+        adapter = llm._active_observers()[-1]
         assert adapter._started == {}
 
     @pytest.mark.asyncio

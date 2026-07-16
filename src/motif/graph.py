@@ -111,28 +111,47 @@ def _active_roots() -> list[Node]:
     return roots if roots is not None else _root_nodes
 
 
+# Observer registries in higher layers (llm, flow, show) register their
+# session-scope ContextVars here at import time; session() activates
+# each with a fresh list. The vars belong to their modules — graph.py
+# only knows they exist and scopes them with the run.
+_scoped_registries: list[ContextVar[list | None]] = []
+
+
+def _register_scoped(var: ContextVar[list | None]) -> None:
+    _scoped_registries.append(var)
+
+
 class session:
-    """Isolate a run's graph. Roots created inside attach to this
-    session, not the process-global list — concurrent runs stop
-    interleaving, and long-lived processes stop accumulating.
+    """Isolate a run. Roots created inside attach to this session, not
+    the process-global list — concurrent runs stop interleaving, and
+    long-lived processes stop accumulating. Observers attached inside
+    (llm.observe/observe_calls, flow.observe, show.show_to) live in the
+    session too and detach with it; process-global observers attached
+    outside any session keep seeing every run's events.
 
         with graph.session() as s:
             await pipeline()
         report = narrate(s.roots)
 
     Tasks spawned inside the block inherit the session via contextvar,
-    same as node parenting.
+    same as node parenting. Nested sessions scope both roots and
+    observers to the innermost session.
     """
 
     def __init__(self):
         self.roots: list[Node] = []
         self._token = None
+        self._scope_tokens: list = []
 
     def __enter__(self) -> "session":
         self._token = _session_roots.set(self.roots)
+        self._scope_tokens = [(var, var.set([])) for var in _scoped_registries]
         return self
 
     def __exit__(self, *args):
+        for var, token in reversed(self._scope_tokens):
+            var.reset(token)
         _session_roots.reset(self._token)
 
 

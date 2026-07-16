@@ -26,6 +26,7 @@ import asyncio
 import copy
 import time
 import warnings
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Callable, Any
 
@@ -34,7 +35,9 @@ from .prompt import (
     system, user, assistant, tool_use, tool_result,
 )
 from . import llm
-from .graph import enter_node, exit_node, current_node, Node, _new_id
+from .graph import (
+    enter_node, exit_node, current_node, Node, _new_id, _register_scoped,
+)
 
 # Re-export show machinery so users can do flow.show(), flow.showing(), etc.
 from .show import show, show_to, showing, clear_show_observers, narrate
@@ -67,11 +70,20 @@ class FlowEvent:
 
 
 _observers: list[Callable[[FlowEvent], None]] = []
+_session_observers: ContextVar[list | None] = ContextVar(
+    "motif_session_flow_observers", default=None)
+_register_scoped(_session_observers)
+
+
+def _active_observers() -> list:
+    scope = _session_observers.get()
+    return scope if scope is not None else _observers
 
 
 def observe(*observers: Callable[[FlowEvent], None]):
-    """Attach observers that receive every flow event."""
-    _observers.extend(observers)
+    """Attach observers that receive every flow event. Inside a
+    graph.session(), scoped to the session."""
+    _active_observers().extend(observers)
 
 
 class observing:
@@ -84,30 +96,34 @@ class observing:
 
     def __init__(self, *observers: Callable[[FlowEvent], None]):
         self._observers = list(observers)
+        self._target: list | None = None
 
     async def __aenter__(self):
-        _observers.extend(self._observers)
+        self._target = _active_observers()
+        self._target.extend(self._observers)
         return self
 
     async def __aexit__(self, *args):
         for obs in self._observers:
             try:
-                _observers.remove(obs)
+                self._target.remove(obs)
             except ValueError:
                 pass
 
 
 def clear_observers():
-    """Remove all flow observers."""
-    _observers.clear()
+    """Remove the active scope's flow observers."""
+    _active_observers().clear()
 
 
 def _emit(event: FlowEvent):
-    for obs in _observers:
-        try:
-            obs(event)
-        except Exception:
-            pass
+    scope = _session_observers.get()
+    for observers in (_observers, scope or ()):
+        for obs in observers:
+            try:
+                obs(event)
+            except Exception:
+                pass
 
 
 def _truncate(text: str, length: int = 120) -> str:
