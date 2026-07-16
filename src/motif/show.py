@@ -221,12 +221,16 @@ class showing:
 # bespoke curation.
 #
 # Default policy:
-#   hidden     compact (invisible by its own contract)
+#   hidden     compact (invisible by its own contract); llm_call records
+#              under a parent that narrates its own output (the record
+#              is redundant with the narrative — drill-in views read it)
 #   collapsed  branch / best_of / cascade / tournament (topology, not
 #              content — their outputs are already one-line summaries);
 #              calls declared role:structure
 #   shown      fan children, reduce, call, agent finals, blackboard
-#              rounds, tree results
+#              rounds, tree results; llm_call records at the root or
+#              under output-less parents (bare verb loops — the record
+#              is the only narrative there)
 #   always     errors surface regardless of policy; a fan wider than
 #              fan_limit collapses to a preview list (salience moves
 #              from the nodes to the aggregate)
@@ -245,9 +249,11 @@ def _first_line(text: str, length: int = 160) -> str:
     return text[: length - 1] + "…" if len(text) > length else text
 
 
-def _node_policy(node) -> str:
+def _node_policy(node, *, parent_narrates: bool = False) -> str:
     """shown | collapsed | hidden — meta['show'] wins, then errors,
-    then kind/role defaults."""
+    then kind/role defaults. parent_narrates means the parent node
+    displays its own output, making an llm_call record beneath it
+    redundant for the narrative (it stays in the graph for drill-in)."""
     override = node.meta.get("show")
     if override:
         return override
@@ -255,9 +261,12 @@ def _node_policy(node) -> str:
         return "shown"
     if node.kind == "compact":
         return "hidden"
+    if node.kind == "llm_call" and parent_narrates:
+        return "hidden"
     if node.kind in _COLLAPSED_KINDS:
         return "collapsed"
-    if node.kind == "call" and str(node.meta.get("model", "")) == "role:structure":
+    if (node.kind in ("call", "llm_call")
+            and str(node.meta.get("model", "")) == "role:structure"):
         return "collapsed"
     return "shown"
 
@@ -340,8 +349,9 @@ def _demote_headings(text: str, below: int) -> str:
     return "\n".join(out)
 
 
-def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
-    policy = _node_policy(node)
+def _narrate_node(node, level: int, fan_limit: int,
+                  parent_narrates: bool = False) -> list[str]:
+    policy = _node_policy(node, parent_narrates=parent_narrates)
 
     if policy == "hidden":
         if node.error:  # errors surface even from hidden nodes
@@ -388,18 +398,24 @@ def _narrate_node(node, level: int, fan_limit: int) -> list[str]:
             parts.append(_heading(level, node.title))
             if node.output:
                 parts.append(_demote_headings(node.output, level))
-            sub = [_collapsed_line(c) for c in node.children]
+            # Decomposition lists the subtree structure, not the call
+            # records tree's own split/leaf/merge calls leave behind.
+            sub = [_collapsed_line(c) for c in node.children
+                   if c.kind == "tree"]
             if sub:
                 parts.append("*Decomposition:*\n" + "\n".join(sub))
 
         case _:
-            # call, reduce, round, step, and anything future: title as a
-            # section, own output as content, visible children recursed.
+            # call, llm_call, item, reduce, round, step, and anything
+            # future: title as a section, own output as content, visible
+            # children recursed. A node that displays its own output
+            # narrates for its children — their call records go quiet.
             parts.append(_heading(level, node.title))
             if node.output:
                 parts.append(_demote_headings(node.output, level))
             for child in node.children:
-                parts.extend(_narrate_node(child, level + 1, fan_limit))
+                parts.extend(_narrate_node(child, level + 1, fan_limit,
+                                           parent_narrates=bool(node.output)))
 
     return parts
 

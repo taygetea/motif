@@ -425,20 +425,22 @@ async def call(
     depth: int = 0,
     **kw,
 ) -> Any:
-    """One LLM call wrapped as a flow node — appears in graph and live display.
+    """An author annotation around one LLM call — a title and display
+    override for a call that is recorded automatically anyway.
 
-    Use this when a bare llm.complete() or llm.extract() call should show up in
-    the trace alongside multi-call patterns. Returns text if no schema, dict if
-    a schema is given.
+    Every bare llm.complete()/llm.extract() already appears in the graph
+    (the call-lifecycle projection records it), so call() is not needed
+    for visibility. Use it to name the call's place in the pipeline and
+    control its salience. Returns text if no schema, dict if a schema is
+    given.
 
         report = await flow.call(SYNTHESIZER | user(material), title="synthesis")
 
         plan = await flow.call(PLANNER | user(topic),
                                schema=PLAN_SCHEMA, title="planning")
 
-    Without this helper, bare llm calls run successfully but are invisible to
-    flow observers (they only emit llm-level events, not flow events), so they
-    don't appear in the live tree or the saved Trace.
+    The one remaining display gap for bare calls is legacy FlowEvents
+    (the live Trace/LiveFlowDisplay layer) — call() still emits those.
     """
     _check_label_kwarg(kw)
     node, parent = enter_node("call", title, model=_model_label(model), **_show_meta(show))
@@ -565,9 +567,12 @@ async def fan(
 
     async def _one(item, idx):
         # enter_node BEFORE semaphore so all children appear in the graph
-        # immediately — TUI can build layout before work starts.
+        # immediately — TUI can build layout before work starts. The
+        # child is an item slot (the unit of work), not a claim that a
+        # call occurred — the call record attaches beneath it when the
+        # verb actually runs.
         name = _item_label(item, idx)
-        child, child_parent = enter_node("call", name, model=_model_label(model))
+        child, child_parent = enter_node("item", name, model=_model_label(model))
         _emit(FlowEvent("start", name, depth + 1, meta={"model": model}))
 
         if sem:

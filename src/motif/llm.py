@@ -3,8 +3,14 @@
 Three verbs: complete(), extract(), act().
 Msg in, text or structured data or action out. render() is implicit.
 
-Observer support: call observe() to attach callbacks that receive
-every LLM call's inputs and outputs. The pipeline stays pure.
+Observation: every verb invocation emits call-lifecycle events —
+CallStarted → CallChunk* → (CallCompleted | CallFailed) — through
+observe_calls(). Each call has its own identity (call_id), so two
+identical concurrent resamples are two distinct facts. The legacy
+(verb, msg, result, model, meta) signature remains available through
+observe(), derived from the same events. The pipeline stays pure;
+this module knows nothing about the computation graph — record.py
+projects these events into graph nodes from above.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import json
+import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Callable, Any
@@ -21,7 +28,6 @@ import anthropic
 import httpx  # transitive dependency of the anthropic SDK — no new top-level dep
 
 from .prompt import Msg, render
-from .graph import current_node
 
 # Load .env from the project root (or any parent). Does nothing if no .env exists.
 load_dotenv()
@@ -36,17 +42,133 @@ except Exception:
     pass  # packaging not available — use the hasattr heuristic
 
 _client: anthropic.AsyncAnthropic | None = None
-_observers: list[Callable] = []
+
+
+# --- Call-lifecycle events: the observation seam ---
+#
+# Pure Layer-2 facts about verb invocations. One CallStarted per call,
+# zero or more CallChunks (streaming), then exactly one of
+# CallCompleted / CallFailed. call_id is the per-call identity —
+# best_of's five judgments are five ids, not one shared node.
+#
+# Events are emitted inline, in the calling task, so an observer can
+# read task-local context (the graph projection reads current_node()).
+
+@dataclass(frozen=True, slots=True)
+class CallStarted:
+    """A verb invocation began. msg is the actual input Msg, retained —
+    replay, lineage, and the loom read it from here."""
+    call_id: str
+    verb: str            # "complete" | "stream" | "extract" | "act"
+    msg: Msg
+    declared: Any        # the model param as passed: str | Endpoint | RoleRef
+    endpoint: Endpoint   # the resolved endpoint that will serve the call
+    params: dict         # max_tokens, temperature, schema, tools — the call's facts
+    meta: dict           # author-supplied meta (fan passes {"node": <label>})
+
+
+@dataclass(frozen=True, slots=True)
+class CallChunk:
+    """One streamed text chunk."""
+    call_id: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class CallCompleted:
+    """The call returned. stop_reason uses the anthropic vocabulary on
+    every transport ("length" arrives as "max_tokens"); a completed
+    call with stop_reason "max_tokens" is a truncation — the verb may
+    still raise Truncated after this event, so cost is always seen."""
+    call_id: str
+    result: Any          # str | dict | ActResult — what the verb returns
+    usage: dict          # token counts; may carry reported_cost
+    stop_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CallFailed:
+    """The call raised. usage is non-empty when the transport billed
+    before failing (e.g. a truncated extract that cannot parse)."""
+    call_id: str
+    error: str
+    exception: BaseException | None = None
+    usage: dict = field(default_factory=dict)
+
+
+_call_observers: list[Callable] = []
+
+# The graph projection slot — set by record.py at import, deliberately
+# not an entry in the observer registry: clear_observers() must not be
+# able to silence the graph, and exactly one projection may exist (a
+# second would double-record every call).
+_projection: Callable | None = None
+
+
+def _new_call_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _emit(event) -> None:
+    if _projection is not None:
+        try:
+            _projection(event)
+        except Exception:
+            pass  # the record must not break the pipeline
+    for obs in _call_observers:
+        try:
+            obs(event)
+        except Exception:
+            pass  # observers must not break the pipeline
+
+
+def observe_calls(*observers: Callable):
+    """Attach observers to the call-lifecycle seam. Each receives
+    CallStarted / CallChunk / CallCompleted / CallFailed events."""
+    _call_observers.extend(observers)
+
+
+class _LegacyAdapter:
+    """Presents the legacy (verb, msg, result, model, meta) observer
+    signature on top of call-lifecycle events. Stateful: correlates by
+    call_id. Chunks become ("chunk", ...) notifications; failures were
+    never notified in the legacy protocol and still aren't."""
+
+    __slots__ = ("fn", "_started")
+
+    def __init__(self, fn: Callable):
+        self.fn = fn
+        self._started: dict[str, CallStarted] = {}
+
+    def __call__(self, event):
+        if isinstance(event, CallStarted):
+            self._started[event.call_id] = event
+        elif isinstance(event, CallChunk):
+            started = self._started.get(event.call_id)
+            if started is not None:
+                self.fn("chunk", started.msg, event.text,
+                        started.endpoint.model, dict(started.meta))
+        elif isinstance(event, CallCompleted):
+            started = self._started.pop(event.call_id, None)
+            if started is not None:
+                self.fn(started.verb, started.msg, event.result,
+                        started.endpoint.model,
+                        {**started.meta, **event.usage})
+        elif isinstance(event, CallFailed):
+            self._started.pop(event.call_id, None)
 
 
 def observe(*observers: Callable):
-    """Attach observer callbacks. Each receives (verb, msg, result, model, meta)."""
-    _observers.extend(observers)
+    """Attach legacy observer callbacks. Each receives
+    (verb, msg, result, model, meta) — derived from the call-lifecycle
+    events by an adapter. New code should prefer observe_calls()."""
+    _call_observers.extend(_LegacyAdapter(o) for o in observers)
 
 
 def clear_observers():
-    """Remove all observers."""
-    _observers.clear()
+    """Remove all observers (both signatures). The graph projection is
+    not an observer and survives."""
+    _call_observers.clear()
 
 
 # Pricing per million tokens (input, output, cache_read, cache_write).
@@ -135,14 +257,6 @@ class CostTracker:
         return (f"Cost: ${self.cost:.4f} "
                 f"({self.input_tokens:,} in / {self.output_tokens:,} out / "
                 f"{self.calls} calls)")
-
-
-def _notify(verb: str, msg: Msg, result: Any, model: str, meta: dict):
-    for obs in _observers:
-        try:
-            obs(verb, msg, result, model, meta)
-        except Exception:
-            pass  # observers should not break the pipeline
 
 
 _max_retries = 3
@@ -424,61 +538,61 @@ async def complete(
     notified first, so cost is tracked). Pass allow_truncation=True to get
     the partial text back as an ordinary return instead.
     """
-    ep = _endpoint(DEFAULT_MODEL if model is _UNSET else model)
+    declared = DEFAULT_MODEL if model is _UNSET else model
+    ep = _endpoint(declared)
 
     if streaming:
-        # Use stream() internally, collect the result
+        # Delegate to stream(), collect the result. The lifecycle is
+        # stream()'s (verb "stream") — no double emission from here.
         chunks = []
-        async for chunk in stream(msg, model=ep, max_tokens=max_tokens,
+        async for chunk in stream(msg, model=declared, max_tokens=max_tokens,
                                    temperature=temperature,
                                    allow_truncation=allow_truncation, meta=meta):
             chunks.append(chunk)
         return "".join(chunks)
 
-    if ep.base_url:
-        payload = render(msg, backend="openai")
-        body = {"model": ep.model, "max_tokens": max_tokens,
-                "messages": payload["messages"]}
-        if temperature is not None:
-            body["temperature"] = temperature
-        data = await _openai_request(ep, body)
-        choice = data["choices"][0]
-        result = choice["message"].get("content") or ""
-        _notify("complete", msg, result, ep.model, {
-            **(meta or {}),
-            **_usage_openai(data),
-        })
-        if choice.get("finish_reason") == "length" and not allow_truncation:
-            raise _truncated(max_tokens, result)
-        return result
+    call_id = _new_call_id()
+    _emit(CallStarted(call_id, "complete", msg, declared, ep,
+                      {"max_tokens": max_tokens, "temperature": temperature},
+                      dict(meta or {})))
+    try:
+        if ep.base_url:
+            payload = render(msg, backend="openai")
+            body = {"model": ep.model, "max_tokens": max_tokens,
+                    "messages": payload["messages"]}
+            if temperature is not None:
+                body["temperature"] = temperature
+            data = await _openai_request(ep, body)
+            choice = data["choices"][0]
+            result = choice["message"].get("content") or ""
+            usage = _usage_openai(data)
+            finish = choice.get("finish_reason")
+            stop_reason = _FINISH_TO_STOP.get(finish, finish)
+        else:
+            client = _get_client()
+            payload = render(msg, backend="anthropic")
+            kwargs = {
+                "model": ep.model,
+                "max_tokens": max_tokens,
+                "messages": payload["messages"],
+            }
+            if "system" in payload:
+                kwargs["system"] = payload["system"]
+            if temperature is not None:
+                kwargs["temperature"] = temperature
 
-    client = _get_client()
-    payload = render(msg, backend="anthropic")
+            response = await client.messages.create(**kwargs)
 
-    kwargs = {
-        "model": ep.model,
-        "max_tokens": max_tokens,
-        "messages": payload["messages"],
-    }
-    if "system" in payload:
-        kwargs["system"] = payload["system"]
-    if temperature is not None:
-        kwargs["temperature"] = temperature
+            result = "\n".join(block.text for block in response.content
+                               if block.type == "text")
+            usage = _usage(response)
+            stop_reason = getattr(response, "stop_reason", None)
+    except Exception as e:
+        _emit(CallFailed(call_id, str(e), e))
+        raise
 
-    response = await client.messages.create(**kwargs)
-
-    text_parts = []
-    for block in response.content:
-        if block.type == "text":
-            text_parts.append(block.text)
-    result = "\n".join(text_parts)
-
-    _notify("complete", msg, result, ep.model, {
-        **(meta or {}),
-        **_usage(response),
-    })
-    if getattr(response, "stop_reason", None) == "max_tokens" \
-            and not allow_truncation:
+    _emit(CallCompleted(call_id, result, usage, stop_reason))
+    if stop_reason == "max_tokens" and not allow_truncation:
         raise _truncated(max_tokens, result)
     return result
 
@@ -503,85 +617,101 @@ async def stream(
         async for chunk in llm.stream(prompt):
             print(chunk, end="", flush=True)
     """
-    ep = _endpoint(DEFAULT_MODEL if model is _UNSET else model)
-    _meta = meta or {}
-    node = current_node()  # graph node from flow context, if any
+    declared = DEFAULT_MODEL if model is _UNSET else model
+    ep = _endpoint(declared)
+    _meta = dict(meta or {})
     full_text = []
 
-    if ep.base_url:
-        payload = render(msg, backend="openai")
-        body = {"model": ep.model, "max_tokens": max_tokens,
-                "messages": payload["messages"], "stream": True,
-                "stream_options": {"include_usage": True},
-                **ep.extra}
-        if temperature is not None:
-            body["temperature"] = temperature
+    call_id = _new_call_id()
+    _emit(CallStarted(call_id, "stream", msg, declared, ep,
+                      {"max_tokens": max_tokens, "temperature": temperature},
+                      _meta))
+    settled = False  # CallCompleted or CallFailed has been emitted
 
-        usage_meta = {}
-        finish_reason = None
-        async with _get_http().stream(
-            "POST", _openai_url(ep), json=body, headers=_openai_headers(ep),
-        ) as resp:
-            if resp.status_code >= 400:
-                detail = (await resp.aread()).decode(errors="replace")[:500]
-                raise httpx.HTTPStatusError(
-                    f"{resp.status_code} from {ep.base_url}: {detail}",
-                    request=resp.request, response=resp)
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[len("data: "):]
-                if data_str.strip() == "[DONE]":
-                    break
-                chunk = json.loads(data_str)
-                if chunk.get("usage"):
-                    usage_meta = _usage_openai(chunk)
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                if choices[0].get("finish_reason"):
-                    finish_reason = choices[0]["finish_reason"]
-                text = (choices[0].get("delta") or {}).get("content")
-                if text:
-                    full_text.append(text)
-                    if node:
-                        node.append_output(text)
-                    _notify("chunk", msg, text, ep.model, _meta)
-                    yield text
+    try:
+        if ep.base_url:
+            payload = render(msg, backend="openai")
+            body = {"model": ep.model, "max_tokens": max_tokens,
+                    "messages": payload["messages"], "stream": True,
+                    "stream_options": {"include_usage": True},
+                    **ep.extra}
+            if temperature is not None:
+                body["temperature"] = temperature
+
+            usage_meta = {}
+            finish_reason = None
+            async with _get_http().stream(
+                "POST", _openai_url(ep), json=body, headers=_openai_headers(ep),
+            ) as resp:
+                if resp.status_code >= 400:
+                    detail = (await resp.aread()).decode(errors="replace")[:500]
+                    raise httpx.HTTPStatusError(
+                        f"{resp.status_code} from {ep.base_url}: {detail}",
+                        request=resp.request, response=resp)
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    chunk = json.loads(data_str)
+                    if chunk.get("usage"):
+                        usage_meta = _usage_openai(chunk)
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    if choices[0].get("finish_reason"):
+                        finish_reason = choices[0]["finish_reason"]
+                    text = (choices[0].get("delta") or {}).get("content")
+                    if text:
+                        full_text.append(text)
+                        _emit(CallChunk(call_id, text))
+                        yield text
+
+            result = "".join(full_text)
+            _emit(CallCompleted(call_id, result, usage_meta,
+                                _FINISH_TO_STOP.get(finish_reason, finish_reason)))
+            settled = True
+            if finish_reason == "length" and not allow_truncation:
+                raise _truncated(max_tokens, result)
+            return
+
+        client = _get_client()
+        payload = render(msg, backend="anthropic")
+
+        kwargs = {
+            "model": ep.model,
+            "max_tokens": max_tokens,
+            "messages": payload["messages"],
+        }
+        if "system" in payload:
+            kwargs["system"] = payload["system"]
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        async with client.messages.stream(**kwargs) as s:
+            async for text in s.text_stream:
+                full_text.append(text)
+                _emit(CallChunk(call_id, text))
+                yield text
+            response = await s.get_final_message()
 
         result = "".join(full_text)
-        _notify("stream", msg, result, ep.model, {**_meta, **usage_meta})
-        if finish_reason == "length" and not allow_truncation:
+        stop_reason = getattr(response, "stop_reason", None)
+        _emit(CallCompleted(call_id, result, _usage(response), stop_reason))
+        settled = True
+        if stop_reason == "max_tokens" and not allow_truncation:
             raise _truncated(max_tokens, result)
-        return
-
-    client = _get_client()
-    payload = render(msg, backend="anthropic")
-
-    kwargs = {
-        "model": ep.model,
-        "max_tokens": max_tokens,
-        "messages": payload["messages"],
-    }
-    if "system" in payload:
-        kwargs["system"] = payload["system"]
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
-    async with client.messages.stream(**kwargs) as s:
-        async for text in s.text_stream:
-            full_text.append(text)
-            if node:
-                node.append_output(text)
-            _notify("chunk", msg, text, ep.model, _meta)
-            yield text
-        response = await s.get_final_message()
-
-    result = "".join(full_text)
-    _notify("stream", msg, result, ep.model, {**_meta, **_usage(response)})
-    if getattr(response, "stop_reason", None) == "max_tokens" \
-            and not allow_truncation:
-        raise _truncated(max_tokens, result)
+    except GeneratorExit:
+        # The consumer abandoned the stream mid-flight (break / close).
+        # Every started call settles exactly once — record the truth.
+        if not settled:
+            _emit(CallFailed(call_id, "stream abandoned before completion"))
+        raise
+    except Exception as e:
+        if not settled:  # Truncated raises after CallCompleted — don't double-emit
+            _emit(CallFailed(call_id, str(e), e))
+        raise
 
 
 async def extract(
@@ -599,94 +729,106 @@ async def extract(
     on older SDK versions). OpenAI-compatible transport: response_format
     json_schema (supported by OpenRouter, llama.cpp, vLLM).
     """
-    ep = _endpoint(DEFAULT_MODEL if model is _UNSET else model)
+    declared = DEFAULT_MODEL if model is _UNSET else model
+    ep = _endpoint(declared)
 
-    if ep.base_url:
-        payload = render(msg, backend="openai")
-        body = {"model": ep.model, "max_tokens": max_tokens,
-                "messages": payload["messages"]}
-        if temperature is not None:
-            body["temperature"] = temperature
+    call_id = _new_call_id()
+    _emit(CallStarted(call_id, "extract", msg, declared, ep,
+                      {"max_tokens": max_tokens, "temperature": temperature,
+                       "schema": schema},
+                      dict(meta or {})))
+    try:
+        if ep.base_url:
+            payload = render(msg, backend="openai")
+            body = {"model": ep.model, "max_tokens": max_tokens,
+                    "messages": payload["messages"]}
+            if temperature is not None:
+                body["temperature"] = temperature
 
-        # Not every endpoint supports json_schema (OpenRouter calls it
-        # "structured_outputs" and 404s a pinned provider without it).
-        # Degrade invisibly: json_schema → json_object + schema in prompt
-        # → bare prompt. The caller just gets their dict.
-        instructed = payload["messages"] + [{
-            "role": "user",
-            "content": ("Respond with only a JSON object matching this "
-                        "schema:\n" + json.dumps(schema)),
-        }]
-        attempts = [
-            {**body, "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "output", "strict": True,
-                                "schema": schema}}},
-            {**body, "messages": instructed,
-             "response_format": {"type": "json_object"}},
-            {**body, "messages": instructed},
-        ]
-        data = None
-        for i, attempt in enumerate(attempts):
-            try:
-                data = await _openai_request(ep, attempt)
-                break
-            except httpx.HTTPStatusError as e:
-                unsupported = e.response.status_code in (400, 404)
-                if not unsupported or i == len(attempts) - 1:
-                    raise
-        content = data["choices"][0]["message"].get("content") or ""
-        result = json.loads(_strip_fences(content))
-        _notify("extract", msg, result, ep.model,
-                {**(meta or {}), **_usage_openai(data)})
-        return result
+            # Not every endpoint supports json_schema (OpenRouter calls it
+            # "structured_outputs" and 404s a pinned provider without it).
+            # Degrade invisibly: json_schema → json_object + schema in prompt
+            # → bare prompt. The caller just gets their dict.
+            instructed = payload["messages"] + [{
+                "role": "user",
+                "content": ("Respond with only a JSON object matching this "
+                            "schema:\n" + json.dumps(schema)),
+            }]
+            attempts = [
+                {**body, "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "output", "strict": True,
+                                    "schema": schema}}},
+                {**body, "messages": instructed,
+                 "response_format": {"type": "json_object"}},
+                {**body, "messages": instructed},
+            ]
+            data = None
+            for i, attempt in enumerate(attempts):
+                try:
+                    data = await _openai_request(ep, attempt)
+                    break
+                except httpx.HTTPStatusError as e:
+                    unsupported = e.response.status_code in (400, 404)
+                    if not unsupported or i == len(attempts) - 1:
+                        raise
+            content = data["choices"][0]["message"].get("content") or ""
+            result = json.loads(_strip_fences(content))
+            usage = _usage_openai(data)
+        else:
+            client = _get_client()
+            payload = render(msg, backend="anthropic")
 
-    model = ep.model
-    client = _get_client()
-    payload = render(msg, backend="anthropic")
-
-    kwargs = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": payload["messages"],
-    }
-    if "system" in payload:
-        kwargs["system"] = payload["system"]
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
-    if _HAS_OUTPUT_CONFIG:
-        kwargs["output_config"] = {
-            "format": {
-                "type": "json_schema",
-                "schema": schema,
+            kwargs = {
+                "model": ep.model,
+                "max_tokens": max_tokens,
+                "messages": payload["messages"],
             }
-        }
-        response = await client.messages.create(**kwargs)
-        for block in response.content:
-            if block.type == "text":
-                result = json.loads(block.text)
-                _notify("extract", msg, result, model, {**(meta or {}), **_usage(response)})
-                return result
-        raise ValueError("No text block in structured response")
+            if "system" in payload:
+                kwargs["system"] = payload["system"]
+            if temperature is not None:
+                kwargs["temperature"] = temperature
 
-    else:
-        # Older SDK — forced tool use as structured output
-        tool_name = "structured_output"
-        kwargs["tools"] = [{
-            "name": tool_name,
-            "description": "Record your structured assessment.",
-            "input_schema": schema,
-        }]
-        kwargs["tool_choice"] = {"type": "tool", "name": tool_name}
+            if _HAS_OUTPUT_CONFIG:
+                kwargs["output_config"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": schema,
+                    }
+                }
+                response = await client.messages.create(**kwargs)
+                result = None
+                for block in response.content:
+                    if block.type == "text":
+                        result = json.loads(block.text)
+                        break
+                if result is None:
+                    raise ValueError("No text block in structured response")
+            else:
+                # Older SDK — forced tool use as structured output
+                tool_name = "structured_output"
+                kwargs["tools"] = [{
+                    "name": tool_name,
+                    "description": "Record your structured assessment.",
+                    "input_schema": schema,
+                }]
+                kwargs["tool_choice"] = {"type": "tool", "name": tool_name}
 
-        response = await client.messages.create(**kwargs)
-        for block in response.content:
-            if block.type == "tool_use" and block.name == tool_name:
-                result = block.input
-                _notify("extract", msg, result, model, {**(meta or {}), **_usage(response)})
-                return result
-        raise ValueError("No tool_use block in structured response")
+                response = await client.messages.create(**kwargs)
+                result = None
+                for block in response.content:
+                    if block.type == "tool_use" and block.name == tool_name:
+                        result = block.input
+                        break
+                if result is None:
+                    raise ValueError("No tool_use block in structured response")
+            usage = _usage(response)
+    except Exception as e:
+        _emit(CallFailed(call_id, str(e), e))
+        raise
+
+    _emit(CallCompleted(call_id, result, usage))
+    return result
 
 
 # --- act: the third verb ---
@@ -744,74 +886,83 @@ async def act(
                 prompt = prompt | tool_use(call.id, call.name, call.input) \\
                                 | tool_result(call.id, output)
     """
-    ep = _endpoint(DEFAULT_MODEL if model is _UNSET else model)
+    declared = DEFAULT_MODEL if model is _UNSET else model
+    ep = _endpoint(declared)
 
-    if ep.base_url:
-        payload = render(msg, backend="openai")
-        body = {"model": ep.model, "max_tokens": max_tokens,
-                "messages": payload["messages"]}
-        if tools:  # some providers 400 on an empty tools array
-            body["tools"] = _tools_to_openai(tools)
-        if temperature is not None:
-            body["temperature"] = temperature
-        data = await _openai_request(ep, body)
-        choice = data["choices"][0]
-        message = choice.get("message") or {}
-        tool_calls = [
-            ToolRequest(
-                id=tc["id"],
-                name=tc["function"]["name"],
-                input=json.loads(tc["function"].get("arguments") or "{}"),
+    call_id = _new_call_id()
+    _emit(CallStarted(call_id, "act", msg, declared, ep,
+                      {"max_tokens": max_tokens, "temperature": temperature,
+                       "tools": tools},
+                      dict(meta or {})))
+    try:
+        if ep.base_url:
+            payload = render(msg, backend="openai")
+            body = {"model": ep.model, "max_tokens": max_tokens,
+                    "messages": payload["messages"]}
+            if tools:  # some providers 400 on an empty tools array
+                body["tools"] = _tools_to_openai(tools)
+            if temperature is not None:
+                body["temperature"] = temperature
+            data = await _openai_request(ep, body)
+            choice = data["choices"][0]
+            message = choice.get("message") or {}
+            tool_calls = [
+                ToolRequest(
+                    id=tc["id"],
+                    name=tc["function"]["name"],
+                    input=json.loads(tc["function"].get("arguments") or "{}"),
+                )
+                for tc in (message.get("tool_calls") or [])
+            ]
+            finish = choice.get("finish_reason")
+            result = ActResult(
+                text=message.get("content") or None,
+                tool_calls=tool_calls,
+                stop_reason=_FINISH_TO_STOP.get(finish, finish),
             )
-            for tc in (message.get("tool_calls") or [])
-        ]
-        finish = choice.get("finish_reason")
-        result = ActResult(
-            text=message.get("content") or None,
-            tool_calls=tool_calls,
-            stop_reason=_FINISH_TO_STOP.get(finish, finish),
-        )
-        _notify("act", msg, result, ep.model,
-                {**(meta or {}), **_usage_openai(data)})
-        return result
+            usage = _usage_openai(data)
+        else:
+            client = _get_client()
+            payload = render(msg, backend="anthropic")
 
-    model = ep.model
-    client = _get_client()
-    payload = render(msg, backend="anthropic")
+            kwargs = {
+                "model": ep.model,
+                "max_tokens": max_tokens,
+                "messages": payload["messages"],
+                "tools": tools,
+            }
+            if "system" in payload:
+                kwargs["system"] = payload["system"]
+            if temperature is not None:
+                kwargs["temperature"] = temperature
 
-    kwargs = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": payload["messages"],
-        "tools": tools,
-    }
-    if "system" in payload:
-        kwargs["system"] = payload["system"]
-    if temperature is not None:
-        kwargs["temperature"] = temperature
+            response = await client.messages.create(**kwargs)
 
-    response = await client.messages.create(**kwargs)
+            # Collect text and tool calls from the response
+            text_parts = []
+            tool_calls = []
 
-    # Collect text and tool calls from the response
-    text_parts = []
-    tool_calls = []
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_calls.append(ToolRequest(
+                        id=block.id,
+                        name=block.name,
+                        input=block.input,
+                    ))
 
-    for block in response.content:
-        if block.type == "text":
-            text_parts.append(block.text)
-        elif block.type == "tool_use":
-            tool_calls.append(ToolRequest(
-                id=block.id,
-                name=block.name,
-                input=block.input,
-            ))
+            result = ActResult(
+                text="\n".join(text_parts) if text_parts else None,
+                tool_calls=tool_calls,
+                stop_reason=getattr(response, "stop_reason", None),
+            )
+            usage = _usage(response)
+    except Exception as e:
+        _emit(CallFailed(call_id, str(e), e))
+        raise
 
-    text = "\n".join(text_parts) if text_parts else None
-    result = ActResult(
-        text=text,
-        tool_calls=tool_calls,
-        stop_reason=getattr(response, "stop_reason", None),
-    )
-
-    _notify("act", msg, result, model, {**(meta or {}), **_usage(response)})
+    # act() never raises on truncation: stop_reason "max_tokens" is a
+    # representable result the agent loop handles (see flow.agent).
+    _emit(CallCompleted(call_id, result, usage, result.stop_reason))
     return result

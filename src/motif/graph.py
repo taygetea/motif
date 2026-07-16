@@ -29,6 +29,10 @@ import time
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .prompt import Msg
 
 
 @dataclass
@@ -40,12 +44,18 @@ class Node:
            │         │          │
            └─────────┴──────────┴──→ error
 
-    output grows during streaming (llm.stream() appends chunks).
+    output grows during streaming (the call-record projection in
+    record.py appends chunks as CallChunk events arrive).
     _version bumps on every mutation — renderers dirty-check this
     instead of subscribing to events.
+
+    msg is the retained input Msg on "llm_call" record nodes (None on
+    pattern nodes) — the loom and counterfactual replay read it. It is
+    deliberately not serialized by to_dict(); trace serialization of
+    Msgs is its own open design question.
     """
     id: str
-    kind: str          # "branch", "fan", "reduce", "call", "agent", "step", etc.
+    kind: str          # "branch", "fan", "reduce", "call", "llm_call", "agent", etc.
     title: str
     children: list[Node] = field(default_factory=list)
     state: str = "pending"
@@ -53,6 +63,7 @@ class Node:
     elapsed: float = 0.0
     meta: dict = field(default_factory=dict)
     error: str | None = None
+    msg: Msg | None = None
     _version: int = 0
     _start_time: float = 0.0
 
@@ -161,6 +172,21 @@ def enter_node(kind: str, title: str, **meta) -> tuple[Node, Node | None]:
     return node, parent
 
 
+def attach(node: Node):
+    """Attach a node under the current node, or as a root if there is
+    none. Unlike enter_node(), does not make the node current — for
+    leaf records (call nodes) that nothing ever nests under, attaching
+    must not perturb the caller's context. llm.stream() in particular
+    yields control back to caller code mid-call; if the record node
+    were current at those yield points, unrelated work would nest
+    under it."""
+    parent = _current_node.get(None)
+    if parent:
+        parent.children.append(node)
+    else:
+        _active_roots().append(node)
+
+
 def exit_node(node: Node, parent: Node | None, *, error: str | None = None):
     """Mark node complete or error, restore parent as current."""
     node.elapsed = time.monotonic() - node._start_time
@@ -175,7 +201,8 @@ def exit_node(node: Node, parent: Node | None, *, error: str | None = None):
 
 
 def current_node() -> Node | None:
-    """Get the current graph node. Used by llm.stream() to write chunks."""
+    """Get the current graph node. Used by the call-record projection
+    (record.py) to decide where a call node attaches."""
     return _current_node.get(None)
 
 

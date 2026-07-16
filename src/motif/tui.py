@@ -68,7 +68,7 @@ class NodePanel(Widget):
     def __init__(self, node: graph.Node, **kwargs):
         super().__init__(**kwargs)
         self._node = node
-        self._rendered_version = -1
+        self._rendered_version = None
         self._md = None
 
     def compose(self) -> ComposeResult:
@@ -80,16 +80,34 @@ class NodePanel(Widget):
         self._md = self.query_one(Markdown)
         self.set_interval(0.1, self._check)
 
+    def _record_child(self):
+        """Streamed chunks land on the llm_call record beneath this node
+        (the call-lifecycle projection), not on the pattern node itself —
+        read through to it while the node has no output of its own."""
+        for child in reversed(self._node.children):
+            if child.kind == "llm_call":
+                return child
+        return None
+
     def _check(self):
-        if self._node._version != self._rendered_version:
-            self._rendered_version = self._node._version
-            if self._md and self._node.output:
-                self._md.update(self._node.output)
+        rec = self._record_child()
+        version = (self._node._version,
+                   rec._version if rec else -1, id(rec))
+        if version != self._rendered_version:
+            self._rendered_version = version
+            text = self._node.output or (rec.output if rec else "")
+            if self._md and text:
+                self._md.update(text)
             status = self.query_one("#status", Static)
             status.update(self._state_text())
 
     def _state_text(self) -> str:
-        match self._node.state:
+        state = self._node.state
+        if state == "running":
+            rec = self._record_child()
+            if rec is not None and rec.state == "streaming":
+                state = "streaming"
+        match state:
             case "pending":
                 return "waiting..."
             case "running":

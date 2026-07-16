@@ -23,7 +23,11 @@ from .prompt import (
     TextSegment, ToolCall, ToolResult,
 )
 from .graph import Node
-from .llm import Endpoint, RoleRef, Truncated, role, use_profile
+from .llm import (
+    Endpoint, RoleRef, Truncated, role, use_profile,
+    CallStarted, CallChunk, CallCompleted, CallFailed,
+)
+from . import record as _record  # installs the graph projection (llm._projection)
 
 __all__ = [
     # Constructors
@@ -38,6 +42,8 @@ __all__ = [
     "render",
     # Endpoints and roles
     "Endpoint", "RoleRef", "role", "use_profile",
+    # Call-lifecycle events (llm.observe_calls)
+    "CallStarted", "CallChunk", "CallCompleted", "CallFailed",
     # Errors
     "Truncated",
 ]
