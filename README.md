@@ -178,14 +178,29 @@ one vocabulary so agent loops run identically on every transport;
 `CostTracker` believes provider-reported billed dollars (OpenRouter) over
 its own pricing table. And silent partial answers don't exist: a response
 that hits `max_tokens` raises `Truncated` (partial text on the exception,
-fix in the message) from `complete()` and `stream()` alike, unless the
-caller passes `allow_truncation=True`.
+fix in the message) from `complete()` and `stream()` alike unless the
+caller passes `allow_truncation=True` — and from `extract()`
+unconditionally, because a JSON document cut mid-stream is never a valid
+partial.
+
+**The call-lifecycle seam.** Every verb invocation emits typed facts:
+`CallStarted(call_id, verb, msg, declared, endpoint, params, meta)` →
+`CallChunk*` → (`CallCompleted` | `CallFailed`). Each call has its own
+identity — five parallel judgments are five facts, identical resamples are
+distinguishable — and `CallStarted` retains the actual input `Msg`, so
+replay and lineage can read what the call really saw. Attach with
+`llm.observe_calls(fn)`; the older `llm.observe(fn)` five-tuple signature
+`(verb, msg, result, model, meta)` still works, derived from the same
+events. A failed call is a fact too (`CallFailed` carries usage when the
+transport billed before failing). You never emit these yourself — the
+verbs do it.
 
 ### Layer 3: Flow patterns (`flow.py`)
 
 Nine named patterns for multi-call orchestration — eight with predetermined
-topology, one that generates topology at runtime — plus `call()` to wrap a
-single verb as a graph node.
+topology, one that generates topology at runtime — plus `group(title)` to
+put a titled section around any work, and `call()` to put an author's title
+on a single verb call.
 
 | Pattern | Does |
 |---------|------|
@@ -207,9 +222,19 @@ the model still reaching for tools, a **finalize turn** strips the tools and
 forces a written answer, so the agent's last word is never a half-finished
 search.
 
-Patterns are not required. Raw loops over the verbs display and trace
-exactly as well — the graph comes from `call()` and the contextvar, not from
-using the blessed shapes.
+Patterns are not required. Every verb call records itself into the graph
+automatically (an `llm_call` node under whatever is running, with usage and
+the input Msg), so raw loops over the verbs trace and display exactly as
+well as the blessed shapes. `call()` is an annotation — a title and a
+salience override for a call that is recorded anyway — and `group()` gives
+a raw loop a titled home:
+
+```python
+with flow.group("turn 1"):
+    thought = await llm.complete(persona | user(state))
+    speech = await llm.complete(persona | user(thought))
+# narrate() renders the group as a section, the calls as its content
+```
 
 ### The graph and the fold (`graph.py`, `show.py`)
 
@@ -234,10 +259,10 @@ on any pattern as the author override:
 
 | default | nodes |
 |---------|-------|
-| hidden | `compact` (invisible by its own contract) |
+| hidden | `compact` (invisible by its own contract); `llm_call` records under a parent that narrates its own output (the record stays in the graph for drill-in) |
 | collapsed | `branch` / `best_of` / `cascade` / `tournament` (topology, not content), calls declared `role:structure` |
-| shown | fan children, `reduce`, calls, agent finals, blackboard rounds |
-| always | errors surface regardless of policy; fans wider than `fan_limit` collapse to a preview list — salience moves from the nodes to the aggregate |
+| shown | fan items, `reduce`, calls, agent finals, blackboard rounds; `llm_call` records at the root or inside output-less containers like `group` — there, the records are the content |
+| always | errors surface regardless of policy (a failed call shows through any parent); fans wider than `fan_limit` collapse to a preview list — salience moves from the nodes to the aggregate |
 
 In practice the defaults carry: the deep-research example produces its
 entire 90KB output document with **zero** display code and zero overrides.
@@ -246,11 +271,14 @@ the `MarkdownRenderer` remain as the escape hatch for bespoke curation, and
 `Trace` / `LiveFlowDisplay` / the Textual TUI consume the same graph live.
 
 **Observers observe; they don't intervene.** The pipeline stays pure —
-display, logging, tracing, cost all attach via `llm.observe()` /
-`flow.observe()`. Observer lists are still module-level global state
-(ergonomic for scripts, shared across concurrent pipelines); graph roots are
-session-scoped. If you need full isolation — a server — the observer lists
-are the seam where an explicit Runtime object will go.
+display, logging, tracing, cost all attach via `llm.observe_calls()` /
+`llm.observe()` / `flow.observe()`. Attach inside a `graph.session()` and
+the observer is scoped to that run: it detaches when the session closes,
+and concurrent runs cannot see each other's events. Attach outside any
+session and it's process-global — it sees every run (a startup-time
+`CostTracker` keeps billing whatever sessions come and go). Scripts need no
+ceremony; servers get isolation from the same `with` block that scopes the
+graph.
 
 ## Why it composes
 
@@ -340,19 +368,22 @@ python examples/deep_research_v2.py "topic" --profile deepseek
 
 ```
 src/motif/
-    prompt.py    ~340 lines   Msg, Block, segments, render — zero dependencies
-    llm.py       ~770 lines   three verbs, Endpoint, roles/profiles,
-                              Anthropic + OpenAI-compatible transports, CostTracker
-    flow.py     ~1230 lines   9 patterns + call + compaction + agent finalize
-    graph.py     ~190 lines   computation graph, contextvar nesting, sessions
-    show.py      ~440 lines   salience policy, narrate fold, display components
+    prompt.py    ~350 lines   Msg, Block, segments, render — zero dependencies
+    llm.py      ~1040 lines   three verbs, Endpoint, roles/profiles, call-
+                              lifecycle events, Anthropic + OpenAI-compatible
+                              transports, CostTracker
+    record.py    ~120 lines   folds call events into graph nodes
+    flow.py     ~1430 lines   9 patterns + group + call + compaction + agent
+    graph.py     ~240 lines   computation graph, contextvar nesting, sessions
+    show.py      ~480 lines   salience policy, narrate fold, display components
     display.py   ~390 lines   Trace, LiveFlowDisplay (rich, optional)
-    tui.py       ~380 lines   Textual TUI (optional)
+    tui.py       ~400 lines   Textual TUI (optional)
 ```
 
-Total: ~3,800 lines. 155 tests, including Hypothesis property tests for the
+Total: ~4,400 lines. 233 tests, including Hypothesis property tests for the
 monoid laws (both operand orders), render integrity, compaction referential
-integrity, transport behavior at the mocked-HTTP boundary, session isolation
+integrity, transport behavior at the mocked-HTTP boundary, call-lifecycle
+emission and projection, session isolation (graph roots and observers alike)
 under concurrency, and the salience policy.
 
 ## Where this is going

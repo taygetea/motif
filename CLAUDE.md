@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`motif` (PyPI: `motif-llm`) is a ~3,800-line prompt algebra library for LLM orchestration. It is a standalone, publishable package, distinct from the parent `regulatedconversation` project (which now depends on it — the engine's fork was retired 2026-07-08). The README.md is the canonical design document **and the system prompt for model authors writing pipelines** — read it before non-trivial changes, and update it when the public API moves. ROADMAP.md holds the direction (the instrument / "real sci-fi interface" vision) and the open-findings ledger.
+`motif` (PyPI: `motif-llm`) is a ~4,400-line prompt algebra library for LLM orchestration. It is a standalone, publishable package, distinct from the parent `regulatedconversation` project (which now depends on it — the engine's fork was retired 2026-07-08). The README.md is the canonical design document **and the system prompt for model authors writing pipelines** — read it before non-trivial changes, and update it when the public API moves. ROADMAP.md holds the direction (the instrument / "real sci-fi interface" vision) and the open-findings ledger.
 
 ## The design standard
 
@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv sync --extra dev --extra display --extra tui   # full dev install
 
-uv run pytest                        # all 171 tests
+uv run pytest                        # all 233 tests
 uv run pytest tests/test_algebra.py  # one file
 uv run pytest tests/test_flow.py::test_branch -xvs
 
@@ -29,21 +29,34 @@ Keys in `.env` (loaded automatically by `llm.py`): `ANTHROPIC_API_KEY`, `OPENROU
 
 ## Architecture
 
-Lower layers never import from higher ones. (One documented exception: `llm.stream()` appends chunks to the current graph node — Layer 2 touching graph.py for live display. Review finding B2; invert via observer if it grows.)
+Lower layers never import from higher ones. (The old B2 exception — `llm.stream()` mutating the current graph node — was eliminated 2026-07-16: llm.py no longer imports graph at all; record.py injects the projection and llm's observer-scope registration downward via `llm._projection` / `graph._register_scoped`.)
 
 ```
 src/motif/
     prompt.py    Layer 1 — Msg, Block, segments, render(). Zero dependencies.
-    llm.py       Layer 2 — complete/extract/act, Endpoint, RoleRef/role/use_profile,
-                 Anthropic SDK + OpenAI-compatible httpx transport, CostTracker.
-    flow.py      Layer 3 — 9 patterns + call + compaction + agent (finalize, signal
-                 tools) + FlowEvents (legacy, slated for retirement).
+    llm.py       Layer 2 — complete/extract/act/stream, Endpoint,
+                 RoleRef/role/use_profile, call-lifecycle events
+                 (CallStarted/CallChunk/CallCompleted/CallFailed — per-call
+                 identity, retained input Msg) with observe_calls() and the
+                 legacy observe() five-tuple derived by a stateful adapter,
+                 Anthropic SDK + OpenAI-compatible httpx transport,
+                 CostTracker. Knows nothing about the graph.
+    record.py    The llm↔graph bridge — projects call events into graph
+                 nodes (kind "llm_call", node id == call_id, Node.msg
+                 retained, usage in meta). Installed at import through the
+                 llm._projection slot; exactly one projection may exist.
+    flow.py      Layer 3 — 9 patterns + group + call + compaction + agent
+                 (finalize, signal tools) + FlowEvents (legacy, slated for
+                 retirement).
     graph.py     Computation graph: Node, contextvar nesting, graph.session()
-                 (per-run root scoping — always use a session for tests/servers).
+                 (per-run scoping of roots AND observer registration; always
+                 use a session for tests/servers). attach() places leaf
+                 records without making them current.
     show.py      Salience policy + narrate() (graph→markdown fold) + display
                  components + MarkdownRenderer.
     display.py   Trace + LiveFlowDisplay (rich, optional; consumes legacy FlowEvents).
-    tui.py       Textual TUI (optional; polls node._version).
+    tui.py       Textual TUI (optional; polls node._version; reads streamed
+                 output through to llm_call record children).
 ```
 
 ### Layer 1: `prompt.py` — the monoid
@@ -57,8 +70,10 @@ Three verbs take `str | Endpoint | RoleRef` as `model`. `Endpoint(model, base_ur
 Rules of the house:
 - **Never hardcode a model id where a role belongs.** Cost is a property of the run, not the program. Pipeline code names roles; profiles name models.
 - `extract()` on the openai transport degrades json_schema → json_object+prompt → bare prompt; keep that invisible.
-- `act()` maps finish_reason to anthropic stop_reason vocabulary (`"length"` → `"max_tokens"`) — agent() depends on it.
-- Observer meta may carry `reported_cost` (OpenRouter actual billing) — CostTracker prefers it over the `_PRICING` table. Keep `_PRICING` current.
+- `act()` maps finish_reason to anthropic stop_reason vocabulary (`"length"` → `"max_tokens"`) — agent() depends on it. Truncation raises `Truncated` from complete/stream (opt out with allow_truncation) and unconditionally from extract; act() returns it as stop_reason instead.
+- Every verb emits its lifecycle exactly once: CallStarted, chunks, then one of CallCompleted/CallFailed — even on truncation (Completed carries stop_reason, then the verb raises) and stream abandonment (Failed). Preserve that invariant in any transport change; cost visibility depends on it.
+- Observer meta may carry `reported_cost` (OpenRouter actual billing) — CostTracker prefers it over the `_PRICING` table (matching is exact-or-suffix, never bare prefix). Keep `_PRICING` current.
+- Registration is scope-local, emission additive: observers attached inside a graph.session() detach with it; process-global observers see every run. clear_observers() clears only the active scope and can never silence the graph projection.
 - Transport tests live at the mocked-HTTP boundary (`httpx.MockTransport`) in `test_llm.py` — test real parsing code, not mocks of our own functions.
 
 ### Layer 3: `flow.py` — patterns
@@ -83,7 +98,7 @@ All patterns: build a graph Node (contextvar parenting — nesting is automatic)
 
 ## Testing
 
-171 tests across 8 files. Always run the full suite before committing changes to `prompt.py`, `flow.py`, `llm.py`, `graph.py`, or `show.py`. Known gaps (see ROADMAP): `best_of`, `tournament`, `flow.call`, `label_key`, show components, TUI internals.
+233 tests across 11 files. Always run the full suite before committing changes to `prompt.py`, `flow.py`, `llm.py`, `graph.py`, `record.py`, or `show.py`. Known gaps (see ROADMAP): show components, TUI internals, the anthropic streaming path (the SDK fake has no `.stream()`).
 
 ## Git workflow
 

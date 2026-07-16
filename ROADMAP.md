@@ -58,29 +58,8 @@ across runs, steering, and salience control at read time.
 The remaining error surface, in rough order of leverage (reordered
 2026-07-13 after a Claude/Sol design conversation — call identity moved
 above rehearsal so replay and planning don't harden around weaker
-semantics):
+semantics; the top two landed 2026-07-16, see the ledger):
 
-- **Call-lifecycle protocol.** Per-call identity at the verb boundary:
-  `CallStarted(call_id, verb, msg, declared_role, resolved_endpoint,
-  params)` / `CallChunk` / `CallCompleted(result, usage)` / `CallFailed` —
-  pure Layer-2 facts emitted through the observation seam (a new
-  signature; an adapter may preserve the legacy five-tuple, but don't
-  promise compatibility). A graph-side projection folds them into
-  execution nodes: bare verbs get automatic call nodes (fixing the
-  standing principle-6 violation that raw verb loops are invisible to
-  the tree), `llm.stream()`'s direct graph mutation (exception B2) is
-  eliminated rather than grown, and identical concurrent resamples
-  become distinguishable — today `best_of` judgments, tournament
-  matches, and tree's split/leaf/merge calls all share one node id.
-  Migration notes: fan's preallocated children become honest item slots
-  the call records link beneath; `flow.call()` becomes an author
-  annotation around an automatically recorded call, not a second claim
-  that a call occurred.
-- **Observer session-scoping.** `llm._observers` / `flow._observers` /
-  `show._show_observers` are the last shared globals (graph roots are
-  session-scoped; the role profile became a ContextVar in the 2026-07-13
-  fixes — it was a shared global too, which this entry wrongly denied).
-  This is the Runtime seam the README names.
 - **Rehearsal, split into three honest artifacts** (was "shape
   rehearsal" — the single-feature framing hid the hard question of
   data-dependent topology):
@@ -128,19 +107,20 @@ semantics):
          semantics: intercept ≠ understand.
        - *Preconditions*: plan runs create PlanNodes only, never
          enter_node(), and must not emit to module-global observers —
-         cost trackers would bill imaginary calls. Strengthens observer
-         session-scoping. Also: envelopes need author-facing maxItems —
-         deep_research_v2's schemas currently declare none, so its
-         honest pre-run answer today is "unknown".
+         cost trackers would bill imaginary calls. Session-scoping
+         landed 2026-07-16 with deliberately ADDITIVE global emission
+         (a startup CostTracker must not go blind when runs adopt
+         sessions), so plan mode still needs an explicit mute-globals
+         gate — a session option or an emission guard, designed with
+         PlanNodes, not before. Also: envelopes need author-facing
+         maxItems — deep_research_v2's schemas currently declare none,
+         so its honest pre-run answer today is "unknown".
   The plan is a distinct representation, not fake execution:
   `Run(plan, execution)` with type-distinct PlanNode/Node joined by
   `realizes=` edges, rendered by one fold over the tagged union.
   Epistemic status ("did this happen") is never encoded as operation
   kind; no fake completed call nodes, ever — that would collide with
   both "nothing mocked" and the loom's "recorded history is what ran."
-- **`flow.group(title)`.** A grouping node with no LLM call — turns,
-  phases, authoring sections. Tiny, worth doing early, but not
-  architecturally prior to the above.
 - **Schema ergonomics.** Hand-written JSON Schema dicts are the largest
   remaining author error surface by volume. Decide: rehearsal-side
   validation (no new API) vs. a schema helper (new surface). Lean
@@ -152,11 +132,36 @@ semantics):
   into alternative continuations is the loom's core operation; a
   provenance rule would preserve today's convention by precluding
   tomorrow's central feature.
-- Open findings from the 2026-07-08 review: CostTracker prefix-matching
-  false positives (C1); `extract()` truncation legibility (C2); test gaps
-  for `best_of`, `tournament`, `flow.call`, `label_key`, show components,
-  TUI internals. (C2 note: `complete()`/`stream()` truncation now raises
-  `Truncated` as of 2026-07-13; `extract()` remains the open half.)
+- Remaining test gaps from the 2026-07-08 review: show components, TUI
+  internals, the anthropic streaming path (the SDK fake has no
+  `.stream()`).
+- TUI reads the salience policy (it currently has its own display logic;
+  2026-07-16 note: NodePanel now reads streamed output through to
+  llm_call record children — a stopgap, not the unification).
+- **motif-llm 0.2 to PyPI** once the above settles.
+- Resolved 2026-07-16 (the call-identity day; fixes by Claude, test-gap
+  audit by Sol):
+    - **Call-lifecycle protocol landed.** CallStarted/CallChunk/
+      CallCompleted/CallFailed with per-call identity, retained input
+      Msg, and usage-on-failure; legacy five-tuple derived by adapter;
+      record.py projects events into llm_call graph nodes (node id ==
+      call_id); B2 eliminated (llm.py no longer imports graph); bare
+      verbs and raw loops are first-class in the graph and in narrate;
+      fan children became honest item slots; flow.call() became an
+      annotation; abandoned streams settle as CallFailed.
+    - **Observer session-scoping landed.** Registration is scope-local
+      to graph.session(), emission additive to process globals; flow
+      and show registries included; clear_observers() clears only the
+      active scope and can never silence the projection.
+    - `flow.group(title)` — the raw-loop story completed.
+    - `extract()` truncation raises Truncated with the raw partial
+      (C2 closed); CostTracker exact-or-suffix matching, chunks no
+      longer counted as calls (C1 closed).
+    - Pattern guards: best_of([]) fails at the boundary; tournament
+      validates the judge's verdict is literally 'a'/'b'; tournament
+      rounds, blackboard rounds, and cascade attempts error their node
+      instead of staying "running" forever.
+    - Test gaps closed for best_of, tournament, flow.call, label_key.
 - Resolved 2026-07-13 (cross-model audit by GPT-5.6 Sol via codex, fixes
   by Sol + Claude): tool-input mutation could rewrite recorded history
   (S1); `tree()` accepted invalid paragraph partitions silently (S2);
@@ -164,8 +169,6 @@ semantics):
   process global (S4); `branch()` guessed the topology from response
   order (S5). Pattern worth keeping: every fix validates before the money
   is spent and puts the fix in the error message.
-- TUI reads the salience policy (it currently has its own display logic).
-- **motif-llm 0.2 to PyPI** once the above settles.
 
 ## Scale 2 — the instrument (a season)
 
@@ -217,16 +220,17 @@ semantics):
        what actually ran (the 2026-07-13 immutability fix is load-bearing
        here).
     2. The observation seam keeps carrying the full per-call facts.
-       (Corrected 2026-07-13: the current tuple gives node-scoped
-       correlation — _notify runs in-task, so current_node() is
-       reachable — but NOT per-call identity; multi-call pattern nodes
-       like best_of share one node, so identical resamples are
-       indistinguishable. The call-lifecycle protocol in Scale 1 is the
-       fix; a loom recorder becomes fully buildable once it lands.)
+       (Satisfied 2026-07-16: the call-lifecycle protocol gives every
+       call its own identity and event stream — identical resamples are
+       distinct facts. A loom recorder is now buildable as a plain
+       observe_calls() observer.)
     3. Never memoize/dedupe calls by content — caching identical calls
        would silently collapse deliberate resamples into one node.
-    4. The graph stays open to additive edge types (variant_of siblings);
-       call nodes retaining their input Msg is the known additive gap.
+    4. The graph stays open to additive edge types (variant_of siblings).
+       (Call nodes retaining their input Msg — the gap this item named —
+       closed 2026-07-16: CallStarted.msg / Node.msg. Trace
+       serialization of retained Msgs is the remaining open design
+       question; to_dict() deliberately skips them.)
 - **Counterfactual debugging** (the loom's human-facing verb; replaces
   both "blame walk" and pipeline-optimization framings, which were
   considered and rejected 2026-07-13 — human judgment is too sparse to
@@ -235,8 +239,9 @@ semantics):
   likely producers → fork one candidate with identity-addressed
   upstream reuse → replay downstream → compare. A sparse judgment
   becomes an experimental query, not a training signal. Two-sided
-  refinement (converged 2026-07-13): once call-lifecycle events retain
-  input Msgs, **lexical lineage** is recoverable post hoc — motif
+  refinement (converged 2026-07-13): now that call-lifecycle events
+  retain input Msgs (landed 2026-07-16), **lexical lineage** is
+  recoverable post hoc — motif
   pipelines interpolate upstream outputs into downstream prompts
   near-verbatim (verified across deep_research_v2's whole chain), so
   producer edges fall out of span-matching, yielding an evidence-ranked
