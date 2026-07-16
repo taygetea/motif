@@ -133,8 +133,8 @@ semantics; the top two landed 2026-07-16, see the ledger):
   Epistemic status ("did this happen") is never encoded as operation
   kind; no fake completed call nodes, ever — that would collide with
   both "nothing mocked" and the loom's "recorded history is what ran."
-- **Delegated endpoints** (designed 2026-07-16 evening, Olivia + Claude +
-  Sol — full contract in notes/2026-07-16-delegated-endpoints-sol.md;
+- **Delegated endpoints** (designed 2026-07-16, Olivia + Claude + Sol —
+  full contract in notes/2026-07-16-delegated-endpoints-sol.md;
   implement canary-first). CLI harnesses (codex exec; claude -p behind a
   hermetic profile) as a third transport: subscription-priced
   intelligence with free built-in web search, versus Exa's per-call
