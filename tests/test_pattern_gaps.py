@@ -288,6 +288,69 @@ class TestCall:
         assert roots[0].error == "completion unavailable"
 
 
+class TestGuards:
+    """Boundary failures fail loudly, and intermediate nodes never
+    stay 'running' after an error (found during the 2026-07-16 gap
+    coverage; fixed the same day)."""
+
+    @pytest.mark.asyncio
+    async def test_best_of_empty_candidates_raises_at_boundary(self):
+        with pytest.raises(ValueError, match="at least one candidate"):
+            await flow.best_of(
+                [], lambda c: user(c), {"type": "object"},
+                title="empty", model="test")
+        assert graph.root_nodes() == []
+
+    @pytest.mark.asyncio
+    async def test_tournament_rejects_invalid_winner_value(self):
+        extract = AsyncMock(return_value={"winner": "banana"})
+        with patch("motif.flow.llm.extract", new=extract):
+            with pytest.raises(ValueError, match="must be 'a' or 'b'"):
+                await flow.tournament(
+                    ["x", "y"], lambda a, b: user("m"), {"type": "object"},
+                    title="strict", model="test")
+        node = graph.root_nodes()[0]
+        assert node.state == "error"
+        rounds = [c for c in node.children if c.kind == "round"]
+        assert rounds and all(r.state == "error" for r in rounds)
+
+    @pytest.mark.asyncio
+    async def test_tournament_judge_failure_errors_the_round(self):
+        extract = AsyncMock(side_effect=RuntimeError("judge down"))
+        with patch("motif.flow.llm.extract", new=extract):
+            with pytest.raises(RuntimeError):
+                await flow.tournament(
+                    ["x", "y"], lambda a, b: user("m"), {"type": "object"},
+                    title="bracket", model="test")
+        node = graph.root_nodes()[0]
+        rounds = [c for c in node.children if c.kind == "round"]
+        assert rounds and all(r.state == "error" for r in rounds)
+
+    @pytest.mark.asyncio
+    async def test_blackboard_agent_failure_errors_the_round(self):
+        complete = AsyncMock(side_effect=RuntimeError("expert down"))
+        with patch("motif.flow.llm.complete", new=complete):
+            with pytest.raises(RuntimeError):
+                await flow.blackboard(
+                    [("expert", lambda b: user(b))], "seed",
+                    title="panel", rounds=1, model="test")
+        node = graph.root_nodes()[0]
+        rounds = [c for c in node.children if c.kind == "round"]
+        assert rounds and all(r.state == "error" for r in rounds)
+
+    @pytest.mark.asyncio
+    async def test_cascade_model_failure_errors_the_attempt(self):
+        complete = AsyncMock(side_effect=RuntimeError("model down"))
+        with patch("motif.flow.llm.complete", new=complete):
+            with pytest.raises(RuntimeError):
+                await flow.cascade(
+                    user("q"), lambda r: user(r), {"type": "object"},
+                    models=["cheap", "expensive"], title="ladder")
+        node = graph.root_nodes()[0]
+        attempts = [c for c in node.children if c.kind == "call"]
+        assert attempts and all(a.state == "error" for a in attempts)
+
+
 class TestBranchLabels:
     @pytest.mark.asyncio
     async def test_label_key_and_fallback_chain(self):

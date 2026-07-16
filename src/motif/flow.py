@@ -681,6 +681,8 @@ async def best_of(
             schema=SCORE_SCHEMA,
         )
     """
+    if not candidates:
+        raise ValueError("best_of() needs at least one candidate")
     node, parent = enter_node("best_of", title, model=_model_label(model),
                               candidates=len(candidates), **_show_meta(show))
     _emit(FlowEvent("start", title, depth,
@@ -742,17 +744,22 @@ async def cascade(
             child, child_parent = enter_node("call", used_model)
             _emit(FlowEvent("start", used_model, depth + 1))
 
-            result = await llm.complete(msg, model=used_model)
+            try:
+                result = await llm.complete(msg, model=used_model)
 
-            if used_model == models[-1]:  # last model — accept regardless
-                child.output = result
-                exit_node(child, child_parent)
-                _emit(FlowEvent("complete", used_model, depth + 1,
-                                 result=_truncate(result), elapsed=child.elapsed))
-                break
+                if used_model == models[-1]:  # last model — accept regardless
+                    child.output = result
+                    exit_node(child, child_parent)
+                    _emit(FlowEvent("complete", used_model, depth + 1,
+                                     result=_truncate(result),
+                                     elapsed=child.elapsed))
+                    break
 
-            judgment = await llm.extract(test_fn(result), schema=test_schema,
-                                         model=model_test)
+                judgment = await llm.extract(test_fn(result), schema=test_schema,
+                                             model=model_test)
+            except Exception as e:
+                exit_node(child, child_parent, error=str(e))
+                raise
 
             if judgment.get("sufficient", False):
                 child.output = result
@@ -968,21 +975,32 @@ async def tournament(
             _emit(FlowEvent("start", round_label, depth + 1,
                              meta={"matches": len(pairs)}))
 
-            judgments = await asyncio.gather(*[
-                llm.extract(judge_fn(a_text, b_text), schema=judge_schema,
-                            model=model)
-                for (_, a_text), (_, b_text) in pairs
-            ])
+            try:
+                judgments = await asyncio.gather(*[
+                    llm.extract(judge_fn(a_text, b_text), schema=judge_schema,
+                                model=model)
+                    for (_, a_text), (_, b_text) in pairs
+                ])
 
-            round_results = []
-            for pair, judgment in zip(pairs, judgments):
-                (a_idx, a_text), (b_idx, b_text) = pair
-                winner = pair[0] if judgment.get(winner_key) == "a" else pair[1]
-                next_round.append(winner)
-                round_results.append({
-                    "a_idx": a_idx, "b_idx": b_idx,
-                    "winner_idx": winner[0], "judgment": judgment,
-                })
+                round_results = []
+                for pair, judgment in zip(pairs, judgments):
+                    (a_idx, a_text), (b_idx, b_text) = pair
+                    verdict = judgment.get(winner_key)
+                    if verdict not in ("a", "b"):
+                        raise ValueError(
+                            f"tournament() judgment field {winner_key!r} must "
+                            f"be 'a' or 'b', got {verdict!r}. Declare it as an "
+                            f"enum in judge_schema: {{{winner_key!r}: "
+                            "{'type': 'string', 'enum': ['a', 'b']}}.")
+                    winner = pair[0] if verdict == "a" else pair[1]
+                    next_round.append(winner)
+                    round_results.append({
+                        "a_idx": a_idx, "b_idx": b_idx,
+                        "winner_idx": winner[0], "judgment": judgment,
+                    })
+            except Exception as e:
+                exit_node(round_node, round_parent, error=str(e))
+                raise
 
             rounds_log.append(round_results)
             round_node.output = f"{len(next_round)} remaining"
@@ -1068,10 +1086,14 @@ async def blackboard(
                     exit_node(agent_node, agent_parent, error=str(e))
                     raise
 
-            contributions = await asyncio.gather(*[
-                _agent_call(name, fn, board, history, round_num + 1)
-                for name, fn in agents
-            ])
+            try:
+                contributions = await asyncio.gather(*[
+                    _agent_call(name, fn, board, history, round_num + 1)
+                    for name, fn in agents
+                ])
+            except Exception as e:
+                exit_node(round_node, round_parent, error=str(e))
+                raise
 
             round_record = {}
             for (name, _), contribution in zip(agents, contributions):
