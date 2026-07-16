@@ -341,6 +341,29 @@ class TestProjection:
             assert records[0].meta["node"] == slot.title
 
     @pytest.mark.asyncio
+    async def test_bare_verbs_record_beneath_a_group(self):
+        """The raw-loop story end to end: a titled group, bare verbs
+        inside, records beneath it — and narrate shows their content
+        because the group has no narrative of its own."""
+        _mock_http(lambda r: httpx.Response(200, json=_chat_response("beat")))
+        with flow.group("turn 1") as node:
+            await llm.complete(user("a"), model=EP)
+            await llm.complete(user("b"), model=EP)
+
+        assert node.kind == "group"
+        assert node.state == "complete"
+        assert [c.kind for c in node.children] == ["llm_call", "llm_call"]
+        assert "beat" in narrate(graph.root_nodes())
+
+    @pytest.mark.asyncio
+    async def test_group_error_marks_node_and_propagates(self):
+        with pytest.raises(RuntimeError, match="boom"):
+            async with flow.group("doomed") as node:
+                raise RuntimeError("boom")
+        assert node.state == "error"
+        assert node.error == "boom"
+
+    @pytest.mark.asyncio
     async def test_stream_chunks_land_on_the_record(self):
         _mock_http(lambda r: httpx.Response(200, content=SSE.encode()))
         collected = []

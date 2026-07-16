@@ -483,6 +483,54 @@ async def call(
 
 
 # ---------------------------------------------------------------------------
+# Grouping — a titled node with no LLM call of its own
+# ---------------------------------------------------------------------------
+
+class group:
+    """Group work under a titled node — turns, phases, authoring
+    sections. The group makes no LLM call; bare verbs inside it record
+    beneath it, and narrate renders those records as the group's
+    content (an output-less parent doesn't narrate for its children).
+
+        with flow.group("turn 1"):
+            thought = await llm.complete(persona | user(state))
+            speech = await llm.complete(persona | user(thought))
+
+    Works as `with` or `async with` (entering a group is context
+    bookkeeping, not I/O — both forms do the same thing). An exception
+    inside marks the group node errored and propagates.
+    """
+
+    def __init__(self, title: str, *, show: str | None = None):
+        self._title = title
+        self._show = _show_meta(show)
+        self.node: Node | None = None
+        self._parent: Node | None = None
+
+    def __enter__(self) -> Node:
+        self.node, self._parent = enter_node("group", self._title,
+                                             **self._show)
+        _emit(FlowEvent("start", self._title, 0))
+        return self.node
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc is not None:
+            exit_node(self.node, self._parent, error=str(exc))
+            _emit(FlowEvent("error", self._title, 0, result=str(exc)))
+        else:
+            exit_node(self.node, self._parent)
+            _emit(FlowEvent("complete", self._title, 0,
+                             elapsed=self.node.elapsed))
+        return False
+
+    async def __aenter__(self) -> Node:
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return self.__exit__(exc_type, exc, tb)
+
+
+# ---------------------------------------------------------------------------
 # Branching — one becomes many
 # ---------------------------------------------------------------------------
 
