@@ -422,8 +422,10 @@ async def compact(
                          result=node.output,
                          meta={"tokens_after": new_est}))
         return new_msg
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -465,8 +467,11 @@ async def call(
     try:
         if schema is not None:
             result = await llm.extract(msg, schema=schema, model=model, **kw)
+            # The annotation node stays silent: the llm_call record
+            # beneath it holds the full JSON and narrates it. Setting a
+            # lossy preview here would replace the real data in the
+            # document (the preview still feeds the live FlowEvent).
             preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in result.items())
-            node.output = preview
         else:
             result = await llm.complete(msg, model=model, **kw)
             node.output = result
@@ -476,9 +481,9 @@ async def call(
         _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
                          result=_truncate(preview)))
         return result
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
-        _emit(FlowEvent("error", title, depth, result=str(e)))
+    except BaseException as e:
+        exit_node(node, parent, error=llm._error_text(e))
+        _emit(FlowEvent("error", title, depth, result=llm._error_text(e)))
         raise
 
 
@@ -515,8 +520,9 @@ class group:
 
     def __exit__(self, exc_type, exc, tb):
         if exc is not None:
-            exit_node(self.node, self._parent, error=str(exc))
-            _emit(FlowEvent("error", self._title, 0, result=str(exc)))
+            exit_node(self.node, self._parent, error=llm._error_text(exc))
+            _emit(FlowEvent("error", self._title, 0,
+                             result=llm._error_text(exc)))
         else:
             exit_node(self.node, self._parent)
             _emit(FlowEvent("complete", self._title, 0,
@@ -590,8 +596,10 @@ async def branch(
                          meta={"count": len(items), "model": model,
                                "leaf_children": True}))
         return items
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -639,8 +647,18 @@ async def fan(
         child, child_parent = enter_node("item", name, model=_model_label(model))
         _emit(FlowEvent("start", name, depth + 1, meta={"model": model}))
 
-        if sem:
-            await sem.acquire()
+        # BaseException throughout: when a sibling fails, the TaskGroup
+        # CANCELS this task — possibly while parked on the semaphore or
+        # mid-call — and a cancelled item must settle its node instead
+        # of staying "running" forever.
+        try:
+            if sem:
+                await sem.acquire()
+        except BaseException as e:
+            exit_node(child, child_parent, error=llm._error_text(e))
+            _emit(FlowEvent("error", name, depth + 1,
+                             result=llm._error_text(e)))
+            raise
         try:
             result = await llm.complete(
                 fn(item), model=model, streaming=streaming,
@@ -650,9 +668,10 @@ async def fan(
             _emit(FlowEvent("complete", name, depth + 1,
                              result=_truncate(result), elapsed=child.elapsed))
             return result
-        except Exception as e:
-            exit_node(child, child_parent, error=str(e))
-            _emit(FlowEvent("error", name, depth + 1, result=str(e)))
+        except BaseException as e:
+            exit_node(child, child_parent, error=llm._error_text(e))
+            _emit(FlowEvent("error", name, depth + 1,
+                             result=llm._error_text(e)))
             raise
         finally:
             if sem:
@@ -672,8 +691,10 @@ async def fan(
         _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
                          meta={"count": len(results)}))
         return results
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -718,8 +739,10 @@ async def reduce(
         _emit(FlowEvent("merge", title, depth, result=_truncate(result),
                          elapsed=node.elapsed))
         return result
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -753,10 +776,16 @@ async def best_of(
                      meta={"candidates": len(candidates), "model": model}))
 
     try:
-        judgments = await asyncio.gather(*[
-            llm.extract(judge_fn(c), schema=judge_schema, model=model)
-            for c in candidates
-        ])
+        # TaskGroup, not gather: when one judgment fails, the others are
+        # cancelled instead of running (and billing) toward a verdict
+        # that can no longer be delivered. Callers see ExceptionGroup.
+        judgments: list = [None] * len(candidates)
+        async with asyncio.TaskGroup() as tg:
+            async def _judge(i, c):
+                judgments[i] = await llm.extract(
+                    judge_fn(c), schema=judge_schema, model=model)
+            for i, c in enumerate(candidates):
+                tg.create_task(_judge(i, c))
 
         best_idx = max(range(len(judgments)),
                        key=lambda i: judgments[i].get(score_key, 0))
@@ -766,8 +795,10 @@ async def best_of(
         _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
                          result=node.output))
         return candidates[best_idx], best_idx, judgments
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -821,8 +852,8 @@ async def cascade(
 
                 judgment = await llm.extract(test_fn(result), schema=test_schema,
                                              model=model_test)
-            except Exception as e:
-                exit_node(child, child_parent, error=str(e))
+            except BaseException as e:
+                exit_node(child, child_parent, error=llm._error_text(e))
                 raise
 
             if judgment.get("sufficient", False):
@@ -844,8 +875,10 @@ async def cascade(
         _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
                          result=node.output, meta={"model_used": used_model}))
         return result, used_model
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -961,16 +994,19 @@ async def tree(
         _emit(FlowEvent("split", title, _depth, children=child_labels,
                          elapsed=time.monotonic() - node._start_time))
 
-        # Recurse in parallel — each recursive call creates its own graph node
-        child_results = await asyncio.gather(*[
-            tree(
-                text, split_fn, split_schema, leaf_fn, merge_fn,
-                paragraph_fn=paragraph_fn, max_depth=max_depth,
-                model_split=model_split, model_leaf=model_leaf,
-                model_merge=model_merge, title=clabel, _depth=_depth + 1,
-            )
-            for clabel, text in zip(child_labels, child_texts)
-        ])
+        # Recurse in parallel — each recursive call creates its own graph
+        # node. TaskGroup: a failing subtree cancels its siblings.
+        child_results: list = [None] * len(child_labels)
+        async with asyncio.TaskGroup() as tg:
+            async def _subtree(i, clabel, text):
+                child_results[i] = await tree(
+                    text, split_fn, split_schema, leaf_fn, merge_fn,
+                    paragraph_fn=paragraph_fn, max_depth=max_depth,
+                    model_split=model_split, model_leaf=model_leaf,
+                    model_merge=model_merge, title=clabel, _depth=_depth + 1,
+                )
+            for i, (clabel, text) in enumerate(zip(child_labels, child_texts)):
+                tg.create_task(_subtree(i, clabel, text))
 
         # Merge — pass labeled results to merge_fn
         merged = await llm.complete(
@@ -980,8 +1016,10 @@ async def tree(
         _emit(FlowEvent("merge", title, _depth,
                          result=_truncate(merged), elapsed=node.elapsed))
         return merged
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -1040,11 +1078,15 @@ async def tournament(
                              meta={"matches": len(pairs)}))
 
             try:
-                judgments = await asyncio.gather(*[
-                    llm.extract(judge_fn(a_text, b_text), schema=judge_schema,
-                                model=model)
-                    for (_, a_text), (_, b_text) in pairs
-                ])
+                # TaskGroup: a failing match cancels the round's others.
+                judgments: list = [None] * len(pairs)
+                async with asyncio.TaskGroup() as tg:
+                    async def _match(i, a_text, b_text):
+                        judgments[i] = await llm.extract(
+                            judge_fn(a_text, b_text), schema=judge_schema,
+                            model=model)
+                    for i, ((_, a_text), (_, b_text)) in enumerate(pairs):
+                        tg.create_task(_match(i, a_text, b_text))
 
                 round_results = []
                 for pair, judgment in zip(pairs, judgments):
@@ -1062,8 +1104,8 @@ async def tournament(
                         "a_idx": a_idx, "b_idx": b_idx,
                         "winner_idx": winner[0], "judgment": judgment,
                     })
-            except Exception as e:
-                exit_node(round_node, round_parent, error=str(e))
+            except BaseException as e:
+                exit_node(round_node, round_parent, error=llm._error_text(e))
                 raise
 
             rounds_log.append(round_results)
@@ -1080,8 +1122,10 @@ async def tournament(
         _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
                          result=node.output, meta={"rounds": round_num}))
         return winner_text, winner_idx, rounds_log
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -1146,17 +1190,23 @@ async def blackboard(
                                      result=_truncate(result),
                                      elapsed=agent_node.elapsed))
                     return result
-                except Exception as e:
-                    exit_node(agent_node, agent_parent, error=str(e))
+                except BaseException as e:
+                    exit_node(agent_node, agent_parent, error=llm._error_text(e))
                     raise
 
             try:
-                contributions = await asyncio.gather(*[
-                    _agent_call(name, fn, board, history, round_num + 1)
-                    for name, fn in agents
-                ])
-            except Exception as e:
-                exit_node(round_node, round_parent, error=str(e))
+                # TaskGroup, not gather: a failing expert cancels the
+                # others instead of letting them run (and bill) into a
+                # round that already failed. Callers see ExceptionGroup.
+                contributions: list = [None] * len(agents)
+                async with asyncio.TaskGroup() as tg:
+                    async def _contribute(i, name, fn):
+                        contributions[i] = await _agent_call(
+                            name, fn, board, history, round_num + 1)
+                    for i, (name, fn) in enumerate(agents):
+                        tg.create_task(_contribute(i, name, fn))
+            except BaseException as e:
+                exit_node(round_node, round_parent, error=llm._error_text(e))
                 raise
 
             round_record = {}
@@ -1178,8 +1228,10 @@ async def blackboard(
         _emit(FlowEvent("complete", title, depth, elapsed=node.elapsed,
                          meta={"rounds": rounds}))
         return board, history
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise
 
 
@@ -1427,6 +1479,8 @@ async def agent(
         return AgentResult(
             output=last_text, signal="max_steps",
             msg=msg, steps=max_steps)
-    except Exception as e:
-        exit_node(node, parent, error=str(e))
+    except BaseException as e:
+        # BaseException: a cancelled pattern must not leave its node
+        # "running" forever. _error_text: str(RuntimeError()) is "".
+        exit_node(node, parent, error=llm._error_text(e))
         raise

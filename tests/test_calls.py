@@ -12,6 +12,7 @@ Three layers, tested at their own altitude:
     verb calls and as a pure fold over hand-built events.
 """
 
+import asyncio
 import json
 
 import httpx
@@ -133,7 +134,10 @@ class TestEventEmission:
         result = await llm.extract(user("q"), schema, model=EP)
         assert result == {"x": 3}
         assert events[0].verb == "extract"
-        assert events[0].params["schema"] is schema
+        # A deep COPY, not an alias: an observer mutating the event
+        # must not be able to change what gets sent.
+        assert events[0].params["schema"] == schema
+        assert events[0].params["schema"] is not schema
         assert events[1].result == {"x": 3}
 
     @pytest.mark.asyncio
@@ -152,11 +156,28 @@ class TestEventEmission:
 
     @pytest.mark.asyncio
     async def test_extract_parse_failure_emits_failed(self):
+        """A parse failure after a billed response carries the usage —
+        the response existed, the bill is real."""
         _mock_http(lambda r: httpx.Response(200, json=_chat_response("not json")))
         events = _events()
         with pytest.raises(json.JSONDecodeError):
             await llm.extract(user("q"), {"type": "object"}, model=EP)
         assert [type(e) for e in events] == [CallStarted, CallFailed]
+        assert events[1].usage["output_tokens"] == 5
+
+    @pytest.mark.asyncio
+    async def test_cost_tracker_native_sees_billed_failures(self):
+        """Attached via observe_calls, CostTracker bills CallFailed
+        usage too — a truncated extract is not free."""
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response('{"x"', finish="length")))
+        tracker = llm.CostTracker()
+        llm.observe_calls(tracker)
+        with pytest.raises(llm.Truncated):
+            await llm.extract(user("q"), {"type": "object"}, model=EP)
+        assert tracker.output_tokens == 5
+        assert tracker.calls == 1
+        assert tracker._models == {}  # started-state cleaned up
 
     @pytest.mark.asyncio
     async def test_act_completes_with_actresult(self):
@@ -166,7 +187,8 @@ class TestEventEmission:
         tools = [{"name": "t", "input_schema": {}}]
         await llm.act(user("q"), tools, model=EP)
         assert events[0].verb == "act"
-        assert events[0].params["tools"] is tools
+        assert events[0].params["tools"] == tools
+        assert events[0].params["tools"] is not tools  # copy, not alias
         assert events[1].result.text == "done"
         assert events[1].stop_reason == "end_turn"
 
@@ -219,6 +241,103 @@ class TestEventEmission:
         await llm.complete(msg, model=EP)
         ids = {e.call_id for e in events}
         assert len(ids) == 2
+
+
+# --- Cancellation settles calls (2026-07-16 review round) ---
+
+class TestCancellation:
+    @pytest.mark.asyncio
+    async def test_cancelled_complete_settles_as_failed(self):
+        """CancelledError is a BaseException — it must still settle the
+        call, or the record leaks a running node forever."""
+        import motif.record as record
+        started = asyncio.Event()
+
+        async def hang(request):
+            started.set()
+            await asyncio.Event().wait()
+
+        _mock_http(hang)
+        events = _events()
+        open_before = set(record._open)
+
+        task = asyncio.create_task(llm.complete(user("q"), model=EP))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert [type(e) for e in events] == [CallStarted, CallFailed]
+        assert events[1].error == "CancelledError"  # never-empty error text
+        node = graph.root_nodes()[0]
+        assert node.state == "error"
+        assert set(record._open) == open_before  # nothing leaked
+
+    @pytest.mark.asyncio
+    async def test_fan_sibling_cancellation_settles_every_item(self):
+        """When one fan item fails, the TaskGroup cancels its siblings —
+        and every cancelled sibling must settle its nodes too."""
+        import motif.record as record
+        open_before = set(record._open)
+
+        async def handler(request):
+            text = json.loads(request.content)["messages"][-1]["content"]
+            if text == "bad":
+                await asyncio.sleep(0.01)
+                return httpx.Response(401, json={"error": "boom"})
+            await asyncio.Event().wait()  # cancelled by the TaskGroup
+
+        _mock_http(handler)
+        with pytest.raises(ExceptionGroup):
+            await flow.fan(["good1", "bad", "good2"], lambda t: user(t),
+                           title="doomed fan", model=EP)
+
+        fan_node = graph.root_nodes()[0]
+        assert fan_node.state == "error"
+        assert len(fan_node.children) == 3
+        for item in fan_node.children:
+            assert item.state == "error"  # not "running", ever
+        assert set(record._open) == open_before
+
+
+# --- Observer attach-time validation ---
+
+class TestObserverValidation:
+    def test_lifecycle_observer_rejected_by_observe(self):
+        """The mix-up would otherwise fail silently inside _emit —
+        an observer that never fires and never errors."""
+        with pytest.raises(TypeError, match="observe_calls"):
+            llm.observe(lambda event: None)
+
+    def test_legacy_observer_rejected_by_observe_calls(self):
+        with pytest.raises(TypeError, match=r"observe\(\)"):
+            llm.observe_calls(lambda verb, msg, result, model, meta: None)
+
+
+# --- Observation is not intervention ---
+
+class TestObserverInsulation:
+    @pytest.mark.asyncio
+    async def test_observer_mutation_cannot_change_the_request(self):
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_chat_response("{}"))
+
+        _mock_http(handler)
+
+        def meddler(event):
+            if isinstance(event, CallStarted):
+                event.params["schema"]["type"] = "array"
+
+        llm.observe_calls(meddler)
+        await llm.extract(user("q"), schema, model=EP)
+
+        sent = seen["body"]["response_format"]["json_schema"]["schema"]
+        assert sent["type"] == "object"    # the request is untouched
+        assert schema["type"] == "object"  # so is the caller's dict
 
 
 # --- Legacy adapter contract ---
@@ -364,6 +483,27 @@ class TestProjection:
         assert node.error == "boom"
 
     @pytest.mark.asyncio
+    async def test_empty_message_exception_still_errors(self):
+        """str(RuntimeError()) is '' — an empty-message failure must
+        not be recorded as success."""
+        with pytest.raises(RuntimeError):
+            with flow.group("empty") as node:
+                raise RuntimeError()
+        assert node.state == "error"
+        assert node.error == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_call_schema_mode_narrates_the_record(self):
+        """The annotation node stays silent; the record's full JSON is
+        the document content — not a mangled 40-char preview."""
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response('{"x": 3}')))
+        await flow.call(user("q"), title="plan",
+                        schema={"type": "object"}, model=EP)
+        doc = narrate(graph.root_nodes())
+        assert '"x": 3' in doc
+
+    @pytest.mark.asyncio
     async def test_stream_chunks_land_on_the_record(self):
         _mock_http(lambda r: httpx.Response(200, content=SSE.encode()))
         collected = []
@@ -457,6 +597,22 @@ class TestNarratePolicy:
                        children=[record])
         doc = narrate([parent])
         assert "rate limited" in doc
+
+    def test_hidden_parent_surfaces_descendant_errors(self):
+        """Errors outrank salience policy — an author's show='hidden'
+        must not swallow a failure beneath it."""
+        failed = _node("llm_call", "complete", error="rate limited")
+        parent = _node("call", "scratch", output="junk",
+                       meta={"show": "hidden"}, children=[failed])
+        doc = narrate([parent])
+        assert "rate limited" in doc
+
+    def test_collapsed_parent_surfaces_descendant_errors(self):
+        failed = _node("llm_call", "extract", error="boom")
+        parent = _node("branch", "discover", output="a, b",
+                       children=[failed])
+        doc = narrate([parent])
+        assert "boom" in doc
 
     def test_tree_decomposition_lists_subtrees_not_records(self):
         subtree = _node("tree", "part one", output="sub result")

@@ -83,8 +83,11 @@ class NodePanel(Widget):
     def _record_child(self):
         """Streamed chunks land on the llm_call record beneath this node
         (the call-lifecycle projection), not on the pattern node itself —
-        read through to it while the node has no output of its own."""
-        for child in reversed(self._node.children):
+        read through to it while the node has no output of its own.
+        FIRST record, not last: a cascade attempt also records its
+        quality-judge extract after the answer, and the panel must show
+        the answer, not the judge's JSON."""
+        for child in self._node.children:
             if child.kind == "llm_call":
                 return child
         return None
@@ -313,15 +316,17 @@ class FlowApp(App):
     def _poll_graph(self):
         """Discover new graph nodes and create widgets for them."""
         for root in graph.root_nodes():
-            self._visit(root, is_fan_child=False)
+            self._visit(root, is_fan_child=False, parent_kind=None)
 
-    def _visit(self, node: graph.Node, *, is_fan_child: bool):
+    def _visit(self, node: graph.Node, *, is_fan_child: bool,
+               parent_kind: str | None = None):
         """Walk the graph, creating widgets for new content nodes."""
         if node.id in self._seen_nodes:
             # Already have a widget — but check for new children
             for child in node.children:
                 child_is_fan = (node.kind == "fan")
-                self._visit(child, is_fan_child=child_is_fan)
+                self._visit(child, is_fan_child=child_is_fan,
+                            parent_kind=node.kind)
             return
 
         if node.kind == "fan":
@@ -355,12 +360,23 @@ class FlowApp(App):
             if self._main:
                 self._main.mount(panel)
 
+        elif node.kind == "llm_call" and parent_kind in (None, "group"):
+            # A bare verb's call record at the root or inside a group —
+            # the record IS the content there (same rule as narrate).
+            # Under pattern nodes the pattern's own panel reads through
+            # to the record instead.
+            self._seen_nodes.add(node.id)
+            panel = SinglePanel(node, id=f"single-{node.id}")
+            if self._main:
+                self._main.mount(panel)
+
         elif node.kind in ("branch", "compact", "step", "tool_call",
-                           "round", "best_of", "cascade", "tournament"):
+                           "round", "best_of", "cascade", "tournament",
+                           "item", "llm_call"):
             # Structural nodes — no panel, just mark as seen
             self._seen_nodes.add(node.id)
 
-        elif node.kind in ("agent", "blackboard", "tree"):
+        elif node.kind in ("agent", "blackboard", "tree", "group"):
             # Container nodes — no panel for the container itself,
             # but recurse into children
             self._seen_nodes.add(node.id)
@@ -370,7 +386,8 @@ class FlowApp(App):
         # Recurse into children we haven't visited
         for child in node.children:
             child_is_fan = (node.kind == "fan")
-            self._visit(child, is_fan_child=child_is_fan)
+            self._visit(child, is_fan_child=child_is_fan,
+                        parent_kind=node.kind)
 
     # --- Trace sidebar ---
 

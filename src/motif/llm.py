@@ -16,11 +16,13 @@ projects these events into graph nodes from above.
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import os
 import json
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Any
 
 from dotenv import load_dotenv
@@ -114,7 +116,26 @@ _projection: Callable | None = None
 
 
 def _new_call_id() -> str:
-    return uuid.uuid4().hex[:12]
+    return uuid.uuid4().hex
+
+
+def _error_text(e: BaseException) -> str:
+    """Never-empty error rendering — str(RuntimeError()) is ''. An
+    ExceptionGroup renders its sub-exceptions: 'unhandled errors in a
+    TaskGroup' tells a reader nothing about what failed."""
+    if isinstance(e, BaseExceptionGroup):
+        subs = "; ".join(_error_text(s) for s in e.exceptions[:3])
+        more = (f" (+{len(e.exceptions) - 3} more)"
+                if len(e.exceptions) > 3 else "")
+        return f"{subs}{more}"
+    return str(e) or type(e).__name__
+
+
+def _snapshot_endpoint(ep: Endpoint) -> Endpoint:
+    """The event's endpoint must not alias mutable request state:
+    an observer editing endpoint.extra before the request is sent
+    would be intervention, not observation."""
+    return replace(ep, extra=copy.deepcopy(ep.extra)) if ep.extra else ep
 
 
 def _active_observers() -> list[Callable]:
@@ -141,11 +162,37 @@ def _emit(event) -> None:
                 pass  # observers must not break the pipeline
 
 
+def _validate_observer(fn: Callable, *, legacy: bool):
+    """Catch the observe()/observe_calls() mix-up at attach time. A
+    wrong-signature observer would otherwise raise TypeError inside
+    _emit, which swallows observer exceptions — the observer silently
+    never fires, which is the worst possible failure mode."""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return  # some C callables have no signature — trust them
+    try:
+        if legacy:
+            sig.bind("verb", None, None, "model", {})
+        else:
+            sig.bind(None)
+    except TypeError:
+        this, other, expected = (
+            ("observe()", "observe_calls()", "(verb, msg, result, model, meta)")
+            if legacy else
+            ("observe_calls()", "observe()", "(event)"))
+        raise TypeError(
+            f"{this} observers receive {expected} — {fn!r} does not accept "
+            f"that signature. Did you mean {other}?") from None
+
+
 def observe_calls(*observers: Callable):
     """Attach observers to the call-lifecycle seam. Each receives
     CallStarted / CallChunk / CallCompleted / CallFailed events.
     Inside a graph.session(), the attachment is scoped to the session
     and detaches with it."""
+    for obs in observers:
+        _validate_observer(obs, legacy=False)
     _active_observers().extend(observers)
 
 
@@ -182,7 +229,15 @@ class _LegacyAdapter:
 def observe(*observers: Callable):
     """Attach legacy observer callbacks. Each receives
     (verb, msg, result, model, meta) — derived from the call-lifecycle
-    events by an adapter. New code should prefer observe_calls()."""
+    events by an adapter. New code should prefer observe_calls().
+
+    Known deltas from the pre-event implementation, both deliberate:
+    an observer attached while a call is already in flight misses that
+    call's remaining notifications (its adapter never saw the start),
+    and each notification receives a fresh meta dict rather than a
+    shared mutable one."""
+    for obs in observers:
+        _validate_observer(obs, legacy=True)
     _active_observers().extend(_LegacyAdapter(o) for o in observers)
 
 
@@ -206,17 +261,21 @@ _PRICING: dict[str, tuple[float, float, float, float]] = {
 
 
 class CostTracker:
-    """LLM observer that tracks token usage and cost.
+    """Observer that tracks token usage and cost.
 
         tracker = CostTracker()
-        llm.observe(tracker)
+        llm.observe_calls(tracker)   # native: sees billed failures too
+        llm.observe(tracker)         # legacy five-tuple: also works
         # ... run pipeline ...
         print(tracker)   # Cost: $0.42 (12,340 in / 3,210 out)
         tracker.cost     # 0.42
         tracker.reset()
 
-    Attaches to llm.observe(), not flow.observe(). Pricing is
-    looked up by model name; unknown models track tokens but not cost.
+    Prefer observe_calls(): the lifecycle events carry usage on
+    CallFailed as well, so a truncated extract or a parse failure
+    after a billed response still pays its bill — the legacy signature
+    never notifies failures at all. Pricing is looked up by model
+    name; unknown models track tokens but not cost.
     """
 
     def __init__(self):
@@ -226,15 +285,30 @@ class CostTracker:
         self.cache_creation_tokens: int = 0
         self.calls: int = 0
         self._cost: float = 0.0
+        self._models: dict[str, str] = {}  # call_id -> resolved model
 
-    def __call__(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
+    def __call__(self, *args):
+        if len(args) == 1:  # native call-lifecycle event
+            event = args[0]
+            if isinstance(event, CallStarted):
+                self._models[event.call_id] = event.endpoint.model
+            elif isinstance(event, CallCompleted):
+                self._record(event.usage, self._models.pop(event.call_id, ""))
+            elif isinstance(event, CallFailed):
+                model = self._models.pop(event.call_id, "")
+                if event.usage:  # billed failures pay their bill
+                    self._record(event.usage, model)
+            return
+        verb, msg, result, model, meta = args  # legacy five-tuple
         if verb == "chunk":
             return  # per-chunk notifications are not calls
+        self._record(meta, model)
 
-        inp = meta.get("input_tokens", 0)
-        out = meta.get("output_tokens", 0)
-        cache_read = meta.get("cache_read_tokens", 0)
-        cache_create = meta.get("cache_creation_tokens", 0)
+    def _record(self, usage: dict, model: str):
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        cache_read = usage.get("cache_read_tokens", 0)
+        cache_create = usage.get("cache_creation_tokens", 0)
 
         self.input_tokens += inp
         self.output_tokens += out
@@ -244,8 +318,8 @@ class CostTracker:
 
         # Providers that report actual billed cost (OpenRouter) beat any
         # table lookup — use the real number and skip estimation.
-        if "reported_cost" in meta:
-            self._cost += meta["reported_cost"] or 0.0
+        if "reported_cost" in usage:
+            self._cost += usage["reported_cost"] or 0.0
             return
 
         # Pricing lookup: exact id or a suffixed variant of a table entry
@@ -279,6 +353,7 @@ class CostTracker:
         self.cache_creation_tokens = 0
         self.calls = 0
         self._cost = 0.0
+        self._models.clear()
 
     def __repr__(self):
         return (f"Cost: ${self.cost:.4f} "
@@ -590,10 +665,14 @@ async def complete(
         return "".join(chunks)
 
     call_id = _new_call_id()
-    _emit(CallStarted(call_id, "complete", msg, declared, ep,
-                      {"max_tokens": max_tokens, "temperature": temperature},
-                      dict(meta or {})))
+    billed: dict = {}  # usage captured the moment a response exists,
+                       # so even a failure after billing pays its bill
     try:
+        _emit(CallStarted(call_id, "complete", msg, declared,
+                          _snapshot_endpoint(ep),
+                          {"max_tokens": max_tokens,
+                           "temperature": temperature},
+                          dict(meta or {})))
         if ep.base_url:
             payload = render(msg, backend="openai")
             body = {"model": ep.model, "max_tokens": max_tokens,
@@ -601,9 +680,10 @@ async def complete(
             if temperature is not None:
                 body["temperature"] = temperature
             data = await _openai_request(ep, body)
+            billed = _usage_openai(data)
             choice = data["choices"][0]
             result = choice["message"].get("content") or ""
-            usage = _usage_openai(data)
+            usage = billed
             finish = choice.get("finish_reason")
             stop_reason = _FINISH_TO_STOP.get(finish, finish)
         else:
@@ -620,13 +700,16 @@ async def complete(
                 kwargs["temperature"] = temperature
 
             response = await client.messages.create(**kwargs)
+            billed = _usage(response)
 
             result = "\n".join(block.text for block in response.content
                                if block.type == "text")
-            usage = _usage(response)
+            usage = billed
             stop_reason = getattr(response, "stop_reason", None)
-    except Exception as e:
-        _emit(CallFailed(call_id, str(e), e))
+    except BaseException as e:
+        # BaseException, not Exception: asyncio.CancelledError must
+        # settle the call too, or the record leaks a running node.
+        _emit(CallFailed(call_id, _error_text(e), e, usage=billed))
         raise
 
     _emit(CallCompleted(call_id, result, usage, stop_reason))
@@ -661,12 +744,15 @@ async def stream(
     full_text = []
 
     call_id = _new_call_id()
-    _emit(CallStarted(call_id, "stream", msg, declared, ep,
-                      {"max_tokens": max_tokens, "temperature": temperature},
-                      _meta))
     settled = False  # CallCompleted or CallFailed has been emitted
+    billed: dict = {}
 
     try:
+        _emit(CallStarted(call_id, "stream", msg, declared,
+                          _snapshot_endpoint(ep),
+                          {"max_tokens": max_tokens,
+                           "temperature": temperature},
+                          _meta))
         if ep.base_url:
             payload = render(msg, backend="openai")
             body = {"model": ep.model, "max_tokens": max_tokens,
@@ -694,7 +780,7 @@ async def stream(
                         break
                     chunk = json.loads(data_str)
                     if chunk.get("usage"):
-                        usage_meta = _usage_openai(chunk)
+                        usage_meta = billed = _usage_openai(chunk)
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -733,22 +819,32 @@ async def stream(
                 _emit(CallChunk(call_id, text))
                 yield text
             response = await s.get_final_message()
+            billed = _usage(response)
 
         result = "".join(full_text)
         stop_reason = getattr(response, "stop_reason", None)
-        _emit(CallCompleted(call_id, result, _usage(response), stop_reason))
+        _emit(CallCompleted(call_id, result, billed, stop_reason))
         settled = True
         if stop_reason == "max_tokens" and not allow_truncation:
             raise _truncated(max_tokens, result)
     except GeneratorExit:
         # The consumer abandoned the stream mid-flight (break / close).
         # Every started call settles exactly once — record the truth.
+        # Caveat: without an explicit aclose(), this runs in the async
+        # generator's GC-finalizer, whose context may not be the
+        # session the call started in — session-scoped observers can
+        # miss it (globals and the graph projection never do). Close
+        # streams you abandon: `async with aclosing(llm.stream(...))`.
         if not settled:
-            _emit(CallFailed(call_id, "stream abandoned before completion"))
+            _emit(CallFailed(call_id, "stream abandoned before completion",
+                             usage=billed))
         raise
-    except Exception as e:
-        if not settled:  # Truncated raises after CallCompleted — don't double-emit
-            _emit(CallFailed(call_id, str(e), e))
+    except BaseException as e:
+        # BaseException: cancellation must settle the call too. The
+        # settled flag keeps Truncated (raised after CallCompleted)
+        # from double-emitting.
+        if not settled:
+            _emit(CallFailed(call_id, _error_text(e), e, usage=billed))
         raise
 
 
@@ -771,12 +867,17 @@ async def extract(
     ep = _endpoint(declared)
 
     call_id = _new_call_id()
-    _emit(CallStarted(call_id, "extract", msg, declared, ep,
-                      {"max_tokens": max_tokens, "temperature": temperature,
-                       "schema": schema},
-                      dict(meta or {})))
     settled = False  # truncation emits its own CallFailed, with usage
+    billed: dict = {}
     try:
+        # schema is deep-copied into the event: an observer mutating
+        # event.params must not be able to change what gets sent.
+        _emit(CallStarted(call_id, "extract", msg, declared,
+                          _snapshot_endpoint(ep),
+                          {"max_tokens": max_tokens,
+                           "temperature": temperature,
+                           "schema": copy.deepcopy(schema)},
+                          dict(meta or {})))
         if ep.base_url:
             payload = render(msg, backend="openai")
             body = {"model": ep.model, "max_tokens": max_tokens,
@@ -811,6 +912,7 @@ async def extract(
                     unsupported = e.response.status_code in (400, 404)
                     if not unsupported or i == len(attempts) - 1:
                         raise
+            billed = _usage_openai(data)
             choice = data["choices"][0]
             content = choice["message"].get("content") or ""
             if choice.get("finish_reason") == "length":
@@ -818,12 +920,11 @@ async def extract(
                 # into an opaque JSONDecodeError. The transport billed us —
                 # the failure event carries the usage.
                 exc = _extract_truncated(max_tokens, content)
-                _emit(CallFailed(call_id, str(exc), exc,
-                                 usage=_usage_openai(data)))
+                _emit(CallFailed(call_id, str(exc), exc, usage=billed))
                 settled = True
                 raise exc
             result = json.loads(_strip_fences(content))
-            usage = _usage_openai(data)
+            usage = billed
         else:
             client = _get_client()
             payload = render(msg, backend="anthropic")
@@ -846,12 +947,12 @@ async def extract(
                     }
                 }
                 response = await client.messages.create(**kwargs)
+                billed = _usage(response)
                 if getattr(response, "stop_reason", None) == "max_tokens":
                     partial = "\n".join(b.text for b in response.content
                                         if b.type == "text")
                     exc = _extract_truncated(max_tokens, partial)
-                    _emit(CallFailed(call_id, str(exc), exc,
-                                     usage=_usage(response)))
+                    _emit(CallFailed(call_id, str(exc), exc, usage=billed))
                     settled = True
                     raise exc
                 result = None
@@ -872,13 +973,13 @@ async def extract(
                 kwargs["tool_choice"] = {"type": "tool", "name": tool_name}
 
                 response = await client.messages.create(**kwargs)
+                billed = _usage(response)
                 if getattr(response, "stop_reason", None) == "max_tokens":
                     partial = str(next(
                         (b.input for b in response.content
                          if b.type == "tool_use"), ""))
                     exc = _extract_truncated(max_tokens, partial)
-                    _emit(CallFailed(call_id, str(exc), exc,
-                                     usage=_usage(response)))
+                    _emit(CallFailed(call_id, str(exc), exc, usage=billed))
                     settled = True
                     raise exc
                 result = None
@@ -888,10 +989,10 @@ async def extract(
                         break
                 if result is None:
                     raise ValueError("No tool_use block in structured response")
-            usage = _usage(response)
-    except Exception as e:
+            usage = billed
+    except BaseException as e:
         if not settled:
-            _emit(CallFailed(call_id, str(e), e))
+            _emit(CallFailed(call_id, _error_text(e), e, usage=billed))
         raise
 
     _emit(CallCompleted(call_id, result, usage))
@@ -957,11 +1058,16 @@ async def act(
     ep = _endpoint(declared)
 
     call_id = _new_call_id()
-    _emit(CallStarted(call_id, "act", msg, declared, ep,
-                      {"max_tokens": max_tokens, "temperature": temperature,
-                       "tools": tools},
-                      dict(meta or {})))
+    billed: dict = {}
     try:
+        # tools are deep-copied into the event: an observer mutating
+        # event.params must not be able to change what gets sent.
+        _emit(CallStarted(call_id, "act", msg, declared,
+                          _snapshot_endpoint(ep),
+                          {"max_tokens": max_tokens,
+                           "temperature": temperature,
+                           "tools": copy.deepcopy(tools)},
+                          dict(meta or {})))
         if ep.base_url:
             payload = render(msg, backend="openai")
             body = {"model": ep.model, "max_tokens": max_tokens,
@@ -971,6 +1077,7 @@ async def act(
             if temperature is not None:
                 body["temperature"] = temperature
             data = await _openai_request(ep, body)
+            billed = _usage_openai(data)
             choice = data["choices"][0]
             message = choice.get("message") or {}
             tool_calls = [
@@ -987,7 +1094,7 @@ async def act(
                 tool_calls=tool_calls,
                 stop_reason=_FINISH_TO_STOP.get(finish, finish),
             )
-            usage = _usage_openai(data)
+            usage = billed
         else:
             client = _get_client()
             payload = render(msg, backend="anthropic")
@@ -1004,6 +1111,7 @@ async def act(
                 kwargs["temperature"] = temperature
 
             response = await client.messages.create(**kwargs)
+            billed = _usage(response)
 
             # Collect text and tool calls from the response
             text_parts = []
@@ -1024,9 +1132,9 @@ async def act(
                 tool_calls=tool_calls,
                 stop_reason=getattr(response, "stop_reason", None),
             )
-            usage = _usage(response)
-    except Exception as e:
-        _emit(CallFailed(call_id, str(e), e))
+            usage = billed
+    except BaseException as e:
+        _emit(CallFailed(call_id, _error_text(e), e, usage=billed))
         raise
 
     # act() never raises on truncation: stop_reason "max_tokens" is a

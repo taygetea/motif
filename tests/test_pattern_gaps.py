@@ -88,8 +88,10 @@ class TestBestOf:
         failure = RuntimeError("judge unavailable")
         extract = AsyncMock(side_effect=failure)
 
+        # TaskGroup semantics (2026-07-16): a failing judgment cancels
+        # its siblings and surfaces as an ExceptionGroup, same as fan.
         with patch("motif.flow.llm.extract", new=extract):
-            with pytest.raises(RuntimeError, match="judge unavailable") as exc_info:
+            with pytest.raises(ExceptionGroup) as exc_info:
                 await flow.best_of(
                     ["a", "b"],
                     lambda candidate: user(candidate),
@@ -98,12 +100,12 @@ class TestBestOf:
                     model="test",
                 )
 
-        assert exc_info.value is failure
+        assert failure in exc_info.value.exceptions
         roots = graph.root_nodes()
         assert len(roots) == 1
         assert roots[0].kind == "best_of"
         assert roots[0].state == "error"
-        assert roots[0].error == "judge unavailable"
+        assert "judge unavailable" in roots[0].error
 
 
 class TestTournament:
@@ -247,7 +249,10 @@ class TestCall:
         complete.assert_not_awaited()
         node = graph.root_nodes()[0]
         assert node.kind == "call"
-        assert node.output == "answer=forty-two, confidence=0.9"
+        # The annotation node stays silent in schema mode (2026-07-16):
+        # the llm_call record beneath it carries the full JSON, and a
+        # lossy preview here would replace it in the document.
+        assert node.output == ""
 
     @pytest.mark.asyncio
     async def test_label_kwarg_is_rejected_before_calling_llm(self):
@@ -318,7 +323,7 @@ class TestGuards:
     async def test_tournament_judge_failure_errors_the_round(self):
         extract = AsyncMock(side_effect=RuntimeError("judge down"))
         with patch("motif.flow.llm.extract", new=extract):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(ExceptionGroup):
                 await flow.tournament(
                     ["x", "y"], lambda a, b: user("m"), {"type": "object"},
                     title="bracket", model="test")
@@ -330,7 +335,7 @@ class TestGuards:
     async def test_blackboard_agent_failure_errors_the_round(self):
         complete = AsyncMock(side_effect=RuntimeError("expert down"))
         with patch("motif.flow.llm.complete", new=complete):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(ExceptionGroup):
                 await flow.blackboard(
                     [("expert", lambda b: user(b))], "seed",
                     title="panel", rounds=1, model="test")

@@ -93,6 +93,20 @@ class TestLlmScoping:
         assert llm._call_observers == [keeper]
 
 
+class TestSessionBoundary:
+    @pytest.mark.asyncio
+    async def test_inner_session_does_not_inherit_outer_current_node(self):
+        """A session is a fresh run scope: work inside must root in the
+        session, not attach to whatever node was current outside."""
+        _mock_ok()
+        with flow.group("outer") as outer_node:
+            with graph.session() as inner:
+                await llm.complete(user("q"), model=Endpoint(
+                    "test-model", base_url="https://example.test/v1"))
+        assert outer_node.children == []
+        assert [n.kind for n in inner.roots] == ["llm_call"]
+
+
 class TestFlowScoping:
     def test_session_observer_sees_events_then_detaches(self):
         seen = []

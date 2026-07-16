@@ -142,16 +142,22 @@ class session:
     def __init__(self):
         self.roots: list[Node] = []
         self._token = None
+        self._node_token = None
         self._scope_tokens: list = []
 
     def __enter__(self) -> "session":
         self._token = _session_roots.set(self.roots)
+        # Suspend the current node: a session is a fresh run scope, and
+        # work inside it must root here — not attach to whatever node
+        # happened to be current in the surrounding context.
+        self._node_token = _current_node.set(None)
         self._scope_tokens = [(var, var.set([])) for var in _scoped_registries]
         return self
 
     def __exit__(self, *args):
         for var, token in reversed(self._scope_tokens):
             var.reset(token)
+        _current_node.reset(self._node_token)
         _session_roots.reset(self._token)
 
 
@@ -207,9 +213,13 @@ def attach(node: Node):
 
 
 def exit_node(node: Node, parent: Node | None, *, error: str | None = None):
-    """Mark node complete or error, restore parent as current."""
+    """Mark node complete or error, restore parent as current.
+
+    The error check is `is not None`, not truthiness — str(e) of a
+    bare exception is "", and an empty-message failure must not be
+    recorded as success."""
     node.elapsed = time.monotonic() - node._start_time
-    if error:
+    if error is not None:
         node.state = "error"
         node.error = error
     elif node.state != "complete":

@@ -289,12 +289,33 @@ def _node_policy(node, *, parent_narrates: bool = False) -> str:
 
 def _collapsed_line(node) -> str:
     preview = _first_line(node.output)
+    if not preview:
+        # A silent annotation node (flow.call with a schema) carries its
+        # content on the llm_call record beneath it — preview from there.
+        record = next((c for c in node.children if c.kind == "llm_call"), None)
+        if record is not None and record.output:
+            flat = " ".join(record.output.split())
+            preview = flat[:157] + "…" if len(flat) > 160 else flat
     line = f"- **{node.title}**"
     if preview:
         line += f" — {preview}"
     if node.error:
         line += f" — ⚠ error: {_first_line(node.error)}"
     return line
+
+
+def _subtree_errors(node) -> list[str]:
+    """Error lines for every failed descendant. Hidden and collapsed
+    nodes still surface the failures beneath them — errors outrank
+    salience policy, whatever the author hid."""
+    lines: list[str] = []
+    stack = list(node.children)
+    while stack:
+        n = stack.pop(0)
+        if n.error:
+            lines.append(f"> ⚠ error in {n.title}: {_first_line(n.error)}")
+        stack.extend(n.children)
+    return lines
 
 
 def _agent_steps_log(node) -> str:
@@ -370,12 +391,14 @@ def _narrate_node(node, level: int, fan_limit: int,
     policy = _node_policy(node, parent_narrates=parent_narrates)
 
     if policy == "hidden":
+        parts = []
         if node.error:  # errors surface even from hidden nodes
-            return [f"> ⚠ error in {node.title}: {_first_line(node.error)}"]
-        return []
+            parts.append(f"> ⚠ error in {node.title}: {_first_line(node.error)}")
+        parts.extend(_subtree_errors(node))  # ...and from beneath them
+        return parts
 
     if policy == "collapsed":
-        return [_collapsed_line(node)]
+        return [_collapsed_line(node)] + _subtree_errors(node)
 
     parts: list[str] = []
     if node.error:
