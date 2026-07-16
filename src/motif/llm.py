@@ -206,6 +206,9 @@ class CostTracker:
         self._cost: float = 0.0
 
     def __call__(self, verb: str, msg: Any, result: Any, model: str, meta: dict):
+        if verb == "chunk":
+            return  # per-chunk notifications are not calls
+
         inp = meta.get("input_tokens", 0)
         out = meta.get("output_tokens", 0)
         cache_read = meta.get("cache_read_tokens", 0)
@@ -223,10 +226,12 @@ class CostTracker:
             self._cost += meta["reported_cost"] or 0.0
             return
 
-        # Look up pricing — strip date suffixes for matching
+        # Pricing lookup: exact id or a suffixed variant of a table entry
+        # ("claude-haiku-4-5-20260101"). Bare prefix matching in both
+        # directions billed lookalike ids against the wrong row.
         base_model = model
-        for name, prices in _PRICING.items():
-            if model.startswith(name) or name.startswith(model):
+        for name in _PRICING:
+            if model == name or model.startswith(name + "-"):
                 base_model = name
                 break
 

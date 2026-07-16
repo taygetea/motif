@@ -497,3 +497,24 @@ class TestCostTracker:
           {"input_tokens": 1_000_000, "output_tokens": 0,
            "reported_cost": 0.05})
         assert t.cost == pytest.approx(0.05)  # not the table's $0.80
+
+    def test_lookalike_ids_do_not_match(self):
+        """A bare prefix of a table entry is NOT that model (the old
+        two-way startswith billed these against the wrong row)."""
+        t = llm.CostTracker()
+        t("complete", None, None, "claude-haiku-4",
+          {"input_tokens": 1_000_000, "output_tokens": 0})
+        assert t.cost == 0.0
+        t("complete", None, None, "claude-haiku-4-55",
+          {"input_tokens": 1_000_000, "output_tokens": 0})
+        assert t.cost == 0.0
+
+    def test_chunks_are_not_calls(self):
+        """Streaming chunk notifications carry no usage and are not
+        API calls — they must not inflate the call count."""
+        t = llm.CostTracker()
+        t("chunk", None, "hel", "claude-haiku-4-5", {})
+        t("chunk", None, "lo", "claude-haiku-4-5", {})
+        t("stream", None, "hello", "claude-haiku-4-5",
+          {"input_tokens": 3, "output_tokens": 2})
+        assert t.calls == 1
