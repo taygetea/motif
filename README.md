@@ -191,9 +191,15 @@ distinguishable — and `CallStarted` retains the actual input `Msg`, so
 replay and lineage can read what the call really saw. Attach with
 `llm.observe_calls(fn)`; the older `llm.observe(fn)` five-tuple signature
 `(verb, msg, result, model, meta)` still works, derived from the same
-events. A failed call is a fact too (`CallFailed` carries usage when the
-transport billed before failing). You never emit these yourself — the
-verbs do it.
+events (both attach points validate the observer's signature, so the
+mix-up fails loudly at attach instead of silently never firing). Every
+started call settles exactly once — truncation, cancellation, and
+abandoned streams included. A failed call is a fact too: `CallFailed`
+carries usage when the transport billed before failing, which is why
+`CostTracker` prefers `observe_calls` — a truncated extract is not free.
+Events are read-only in effect as well as intent: params are deep-copied,
+so observation cannot alter what gets sent. You never emit these
+yourself — the verbs do it.
 
 ### Layer 3: Flow patterns (`flow.py`)
 

@@ -60,6 +60,18 @@ The remaining error surface, in rough order of leverage (reordered
 above rehearsal so replay and planning don't harden around weaker
 semantics; the top two landed 2026-07-16, see the ledger):
 
+- **Deep immutability for tool inputs** (S1's ghost, promoted after the
+  2026-07-16 review round). `ToolCall.input` is a mutable dict inside a
+  shallowly-frozen Msg: anyone holding a Msg — or the retained
+  `Node.msg` record — can rewrite recorded history in place (Sol's
+  repro: `node.msg.segments[0].input["q"] = ...` changed both the
+  record and the caller's original). Deep-copying retained Msgs was
+  rejected: it destroys the structural sharing agent loops depend on
+  (20 steps would retain 20 full history copies). The right fix is
+  deep immutability at construction in prompt.py — an immutable-mapping
+  freeze of tool inputs — which touches render() (json needs plain
+  dicts) and the algebra tests. Layer 1 surgery; do it fresh, with
+  property tests, not at the end of a long day.
 - **Rehearsal, split into three honest artifacts** (was "shape
   rehearsal" — the single-feature framing hid the hard question of
   data-dependent topology):
@@ -139,8 +151,51 @@ semantics; the top two landed 2026-07-16, see the ledger):
   2026-07-16 note: NodePanel now reads streamed output through to
   llm_call record children — a stopgap, not the unification).
 - **motif-llm 0.2 to PyPI** once the above settles.
+- Design decisions from the 2026-07-16 review round, recorded so they
+  stay decisions rather than defaults:
+    - **Additive global observers stand — for now.** Sol argued
+      exclusive-by-default (tenant confidentiality: ambient process
+      observers see every session's CallStarted.msg; double-delivery
+      when the same tracker is attached globally and locally;
+      clear_observers() is context-sensitive ambient behavior). The
+      counter that carried today: motif's current population is single-
+      experimenter, and exclusive semantics silently blind a startup
+      CostTracker the moment runs adopt sessions — a worse invisible
+      mistake than any of the above at present scale. REVISIT BEFORE
+      ANY MULTI-TENANT DEPLOYMENT: likely session(isolate=True) or a
+      payload-minimized event stream for global telemetry.
+    - **A session is a scope, not a lifetime barrier.** Tasks spawned
+      inside a session that outlive its block keep emitting to it —
+      s.roots can grow after narrate() starts reading. Documented, not
+      prevented; a cancellation boundary is Scale-2 runtime work.
+    - **Abandoned async generators settle in the GC-finalizer's
+      context**: an unclosed stream's CallFailed may miss session-
+      scoped observers (globals and the projection always see it).
+      Close what you abandon (`aclosing`); noted in stream()'s code.
+    - The graph record is not yet a full replay record (params/author
+      meta/endpoint config not all stamped; to_dict drops msg) — that
+      is Scale-2 replay work, tracked there, and "the complete record"
+      language was softened accordingly.
 - Resolved 2026-07-16 (the call-identity day; fixes by Claude, test-gap
   audit by Sol):
+    - **The review-round fixes** (evening; Sol xhigh audit + a 59-agent
+      adversarial workflow, 18 raw findings → 14 confirmed →
+      deduplicated): BaseException settlement everywhere (cancellation
+      leaked record._open and running-forever nodes — fan's own
+      TaskGroup triggered it first-party); gather → TaskGroup in
+      best_of/tree/tournament/blackboard (failing calls now cancel
+      siblings instead of billing on; callers see ExceptionGroup);
+      CallStarted deep-copies schema/tools/extra (observers could
+      mutate the outgoing request through the event); usage captured
+      before parsing so CallFailed pays its bill, and CostTracker
+      consumes lifecycle events natively; observe()/observe_calls()
+      signature validation at attach (the mix-up was silently
+      swallowed); exit_node error is `is not None` + never-empty error
+      text (empty-message exceptions recorded as success); sessions
+      suspend the outer current node; narrate surfaces descendant
+      errors through hidden/collapsed parents; flow.call(schema=) no
+      longer replaces data with a preview; full-length call ids; TUI
+      reads the first record and dispatches the new kinds.
     - **Call-lifecycle protocol landed.** CallStarted/CallChunk/
       CallCompleted/CallFailed with per-call identity, retained input
       Msg, and usage-on-failure; legacy five-tuple derived by adapter;
