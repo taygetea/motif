@@ -260,6 +260,17 @@ class TestOpenAIExtract:
         with pytest.raises(httpx.HTTPStatusError):
             await llm.extract(user("q"), self.SCHEMA, model=EP)
 
+    @pytest.mark.asyncio
+    async def test_truncation_raises_before_parse(self):
+        """finish_reason='length' on structured output raises Truncated
+        with the raw partial — not an opaque JSONDecodeError."""
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response('{"x": 1, "y"', finish="length")))
+        with pytest.raises(llm.Truncated) as exc:
+            await llm.extract(user("q"), self.SCHEMA, model=EP, max_tokens=16)
+        assert exc.value.partial == '{"x": 1, "y"'
+        assert "max_tokens=16" in str(exc.value)
+
 
 # --- act() over the openai transport ---
 
@@ -426,6 +437,33 @@ class TestAnthropicPath:
                                                   "input_schema": {}}])
         assert not result.done
         assert result.tool_calls[0].name == "search"
+
+    @pytest.mark.asyncio
+    async def test_extract_truncation_raises_output_config_path(self, monkeypatch):
+        """A structured response cut at max_tokens is never parseable —
+        Truncated, with the raw text as .partial."""
+        response = _FakeResponse([_FakeBlock("text", text='{"partial')])
+        response.stop_reason = "max_tokens"
+        monkeypatch.setattr(llm, "_client", _FakeClient(response))
+        monkeypatch.setattr(llm, "_HAS_OUTPUT_CONFIG", True)
+        with pytest.raises(llm.Truncated) as exc:
+            await llm.extract(user("q"), {"type": "object"},
+                              model="claude-haiku-4-5", max_tokens=8)
+        assert exc.value.partial == '{"partial'
+
+    @pytest.mark.asyncio
+    async def test_extract_truncation_raises_forced_tool_path(self, monkeypatch):
+        response = _FakeResponse([
+            _FakeBlock("tool_use", id="t1", name="structured_output",
+                       input={"half": "done"}),
+        ])
+        response.stop_reason = "max_tokens"
+        monkeypatch.setattr(llm, "_client", _FakeClient(response))
+        monkeypatch.setattr(llm, "_HAS_OUTPUT_CONFIG", False)
+        with pytest.raises(llm.Truncated) as exc:
+            await llm.extract(user("q"), {"type": "object"},
+                              model="claude-haiku-4-5", max_tokens=8)
+        assert "half" in exc.value.partial
 
 
 # --- CostTracker ---

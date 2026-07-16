@@ -497,10 +497,13 @@ def _tools_to_openai(tools: list[dict]) -> list[dict]:
 
 
 class Truncated(RuntimeError):
-    """A completion hit max_tokens and returned only a partial answer.
+    """The response hit max_tokens and is only partial.
 
-    Raised by complete() and stream() so truncation cannot masquerade as a
-    successful result. The partial text is available as `.partial`.
+    Raised by complete() and stream() so truncation cannot masquerade as
+    a successful result (allow_truncation=True opts back in to partial
+    text), and by extract() unconditionally — a JSON document cut mid-
+    stream is never a valid partial, so there is nothing to opt in to.
+    The raw partial text is available as `.partial`.
     """
 
     def __init__(self, message: str, partial: str = ""):
@@ -513,6 +516,14 @@ def _truncated(max_tokens: int, partial: str) -> Truncated:
         f"Response hit max_tokens={max_tokens} — this is a partial answer, "
         f"not a complete one. Raise max_tokens, or pass allow_truncation=True "
         f"to accept partial output (available on the exception as .partial).",
+        partial)
+
+
+def _extract_truncated(max_tokens: int, partial: str) -> Truncated:
+    return Truncated(
+        f"extract() response hit max_tokens={max_tokens} — the structured "
+        f"output was cut mid-JSON and cannot be parsed. Raise max_tokens or "
+        f"ask for less. The raw partial text is on the exception as .partial.",
         partial)
 
 
@@ -737,6 +748,7 @@ async def extract(
                       {"max_tokens": max_tokens, "temperature": temperature,
                        "schema": schema},
                       dict(meta or {})))
+    settled = False  # truncation emits its own CallFailed, with usage
     try:
         if ep.base_url:
             payload = render(msg, backend="openai")
@@ -772,7 +784,17 @@ async def extract(
                     unsupported = e.response.status_code in (400, 404)
                     if not unsupported or i == len(attempts) - 1:
                         raise
-            content = data["choices"][0]["message"].get("content") or ""
+            choice = data["choices"][0]
+            content = choice["message"].get("content") or ""
+            if choice.get("finish_reason") == "length":
+                # Cut mid-JSON: fail legibly before json.loads turns this
+                # into an opaque JSONDecodeError. The transport billed us —
+                # the failure event carries the usage.
+                exc = _extract_truncated(max_tokens, content)
+                _emit(CallFailed(call_id, str(exc), exc,
+                                 usage=_usage_openai(data)))
+                settled = True
+                raise exc
             result = json.loads(_strip_fences(content))
             usage = _usage_openai(data)
         else:
@@ -797,6 +819,14 @@ async def extract(
                     }
                 }
                 response = await client.messages.create(**kwargs)
+                if getattr(response, "stop_reason", None) == "max_tokens":
+                    partial = "\n".join(b.text for b in response.content
+                                        if b.type == "text")
+                    exc = _extract_truncated(max_tokens, partial)
+                    _emit(CallFailed(call_id, str(exc), exc,
+                                     usage=_usage(response)))
+                    settled = True
+                    raise exc
                 result = None
                 for block in response.content:
                     if block.type == "text":
@@ -815,6 +845,15 @@ async def extract(
                 kwargs["tool_choice"] = {"type": "tool", "name": tool_name}
 
                 response = await client.messages.create(**kwargs)
+                if getattr(response, "stop_reason", None) == "max_tokens":
+                    partial = str(next(
+                        (b.input for b in response.content
+                         if b.type == "tool_use"), ""))
+                    exc = _extract_truncated(max_tokens, partial)
+                    _emit(CallFailed(call_id, str(exc), exc,
+                                     usage=_usage(response)))
+                    settled = True
+                    raise exc
                 result = None
                 for block in response.content:
                     if block.type == "tool_use" and block.name == tool_name:
@@ -824,7 +863,8 @@ async def extract(
                     raise ValueError("No tool_use block in structured response")
             usage = _usage(response)
     except Exception as e:
-        _emit(CallFailed(call_id, str(e), e))
+        if not settled:
+            _emit(CallFailed(call_id, str(e), e))
         raise
 
     _emit(CallCompleted(call_id, result, usage))

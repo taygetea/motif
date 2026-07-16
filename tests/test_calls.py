@@ -137,6 +137,20 @@ class TestEventEmission:
         assert events[1].result == {"x": 3}
 
     @pytest.mark.asyncio
+    async def test_extract_truncation_fails_with_usage(self):
+        """A truncated extract is a CallFailed — there is no valid
+        partial dict — but the transport billed us, so the failure
+        event carries the usage. Emitted exactly once."""
+        _mock_http(lambda r: httpx.Response(
+            200, json=_chat_response('{"x"', finish="length")))
+        events = _events()
+        with pytest.raises(llm.Truncated):
+            await llm.extract(user("q"), {"type": "object"}, model=EP)
+        assert [type(e) for e in events] == [CallStarted, CallFailed]
+        assert events[1].usage["output_tokens"] == 5
+        assert isinstance(events[1].exception, llm.Truncated)
+
+    @pytest.mark.asyncio
     async def test_extract_parse_failure_emits_failed(self):
         _mock_http(lambda r: httpx.Response(200, json=_chat_response("not json")))
         events = _events()
